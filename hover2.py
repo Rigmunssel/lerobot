@@ -1,224 +1,554 @@
+"""
+TWO-HAND CHESS ROBOT — HOVER2.PY
+
+═══════════════════════════════════════════════════════════════════════════════
+CONFIGURATION GUIDE
+═══════════════════════════════════════════════════════════════════════════════
+
+WHAT YOU NEED TO CONFIGURE FOR EACH HAND:
+
+1. CONNECTION SETTINGS (required)
+   ─────────────────────────────────
+   • port         — USB port (e.g. "/dev/ttyACM4")
+                    Find with: ls /dev/ttyACM*
+   • robot_id     — Config file name without .json (e.g. "follower1")
+
+2. HARDWARE GEOMETRY (measure or use existing calibration)
+   ─────────────────────────────────────────────────────────
+   • z_offset     — Vertical offset in metres (typically ~-0.008 m)
+   • l_upper      — Upper arm length in metres (typically 0.13 m)
+   • l_forearm    — Forearm length in metres (typically 0.14 m)
+   • pan_x        — Pan axis X offset in metres (typically 0.08 m)
+   • pan_y        — Pan axis Y offset in metres (typically 0.0016 m)
+   
+   → Leave these at hand1's values unless you measure differences
+
+3. ANGLE CALIBRATION (critical — determines accuracy)
+   ───────────────────────────────────────────────────
+   Move arm STRAIGHT UP (vertical), then read angles with position2.py:
+   
+   • sh_vertical  — shoulder_lift angle when arm points straight up
+   • el_vertical  — elbow_flex angle when forearm is collinear with upper arm
+   • pan_offset   — calibration offset added to computed facing angle
+   
+   → Use position2.py: make arm limp, point it straight up, record angles
+
+4. MOVEMENT POSES (degrees — use hand1 values as starting point)
+   ─────────────────────────────────────────────────────────────────
+   Safe pose (arm moves here before wrist rotation):
+   • safe_lift_deg, safe_elbow_deg
+   
+   Approach pose (height before descending to board):
+   • approach_lift_deg, approach_elbow_deg, approach_wrist_flex_deg, approach_wrist_roll_deg
+   
+   Base/home pose (resting position):
+   • grasp_pan_deg, grasp_lift_deg, grasp_elbow_deg, grasp_wrist_flex_deg, grasp_wrist_roll_deg
+   
+   → Start with hand1's values, adjust if needed
+
+5. GRIPPER (degrees)
+   ───────────────────
+   • gripper_default_deg  — Open/resting position
+   • gripper_closed_deg   — Closed/grasping position
+   
+   → Use position2.py to find gripper angles
+
+6. Z-DEPTHS (metres — how low to descend when picking)
+   ─────────────────────────────────────────────────────
+   • target_z_down       — Normal pick/place height (typically 0.065 m)
+   • target_z_down_edge  — Extra-low for edge columns (typically 0.055 m)
+   • edge_columns        — Tuple of columns using lower height (e.g. ('a', 'h'))
+   
+   → Measure board height, subtract piece height
+
+7. BOARD POSITIONS (pan, lift, elbow, wrist_flex in degrees)
+   ────────────────────────────────────────────────────────────
+   • board_positions     — Dictionary mapping square names to (pan, lift, elbow, wrist) tuples
+                          e.g. "a1": (45.0, -5.6, 17.1, 104.9)
+   
+   → Run get_positions.py to generate these systematically
+   → OR use interactive adjustment mode ('y' when prompted during moves)
+
+8. OUT POSITION (for captured pieces)
+   ───────────────────────────────────
+   • out_position        — Key in board_positions dict (default "out")
+                          This is where captured pieces are dropped
+   
+   → Calibrate an off-board position reachable by the hand
+
+═══════════════════════════════════════════════════════════════════════════════
+HOW TO CALIBRATE:
+
+Step 1: Connect hand and make it limp
+        python position2.py  (edit PORT and ROBOT_ID first)
+
+Step 2: Move arm straight up, record angles → update sh_vertical, el_vertical
+
+Step 3: Test pan facing angles → adjust pan_offset if needed
+
+Step 4: Generate board positions
+        python get_positions.py  (generates grid of positions)
+        → Copy output into board_positions dict below
+
+Step 5: Fine-tune positions during first moves
+        → Answer 'y' when prompted to adjust
+        → Use p/o (pan), l/k (lift), e/w (elbow), j/h (wrist)
+        → Press Enter to save, positions auto-save to coordinates_handX.txt
+
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+import ast
 import math
+import sys
+import termios
 import time
+import tty
+from dataclasses import dataclass, field
 from pathlib import Path
+
 from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-PORT     = "/dev/ttyACM4"
-ROBOT_ID = "follower1"
 
-# Hardware geometry (metres)
-Z_OFFSET  = -0.0078
-L_UPPER   =  0.13
-L_FOREARM =  0.14
-PAN_X     =  0.08
-PAN_Y     =  0.0016
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARED movement / timing / tolerance parameters (identical for both hands)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Angle references (degrees) — "straight up" calibration offsets
-SH_VERTICAL = 1.5    # shoulder raw angle when arm points straight up
-EL_VERTICAL = -85.2  # elbow raw angle when forearm is collinear with upper arm
+STEP_DEG               =  2.0    # step size (°) for shoulder / elbow / wrist moves
+STEP_DEG_DOWN          =  1.0    # step size (°) when lowering arm
+STEP_DEG_UP            =  1.0    # step size (°) when raising arm
+MIN_STEP_DEG           =  0.5    # minimum step (°) — prevents sub-resolution stalls
+STEP_WAIT_SEC          =  0.01   # pause between steps for general movements
+STEP_WAIT_DOWN_SEC     =  0.05   # pause between steps when lowering arm
+STEP_WAIT_UP_SEC       =  0.05   # pause between steps when raising arm
+STEP_DEG_GRIPPER       =  1.0    # step size (°) for gripper open/close
+STEP_WAIT_GRIPPER_SEC  =  0.05   # pause between steps for gripper
+PAN_STEP_DEG           =  10.0   # step size (°) for pan rotation
+FOREARM_ANGLE_DEG      =  -15    # shoulder_lift + elbow_flex sum kept constant during sweep
+TOLERANCE_PAN          =  0.55   # pan "close enough" threshold (°)
+TOLERANCE_DEG          =  0.1    # "at target" threshold for vertical moves (°)
+APPROACH_TOLERANCE_DEG =  0.55   # good-enough tolerance for approach / grasp poses
+GRIPPER_TOLERANCE_DEG  =  1.0    # tight tolerance for gripper open/close
+ADJUST_STEP_DEG        =  1.0    # nudge size (°) per keypress during interactive adjustment
 
-# Pan calibration offset added to the computed facing angle
-PAN_OFFSET = -4.1
 
-# ── Movement parameters ───────────────────────────────────────────────────────
-STEP_DEG               =  2.0  # step size (°) for shoulder / elbow / wrist moves
-STEP_DEG_DOWN          =  1.0  # step size (°) when lowering arm
-STEP_DEG_UP            =  1.0  # step size (°) when raising arm
-MIN_STEP_DEG           =  0.5  # minimum step (°) — prevents getting stuck on sub-resolution moves
-STEP_WAIT_SEC          =  0.01  # pause between steps for general movements (pan, shoulder, approach)
-STEP_WAIT_DOWN_SEC     =  0.05  # pause between steps when lowering arm
-STEP_WAIT_UP_SEC       =  0.05  # pause between steps when raising arm
-STEP_DEG_GRIPPER       =  1.0   # step size (°) for gripper open/close
-STEP_WAIT_GRIPPER_SEC  =  0.05  # pause between steps for gripper
-PAN_STEP_DEG           =  10.0  # step size (°) for pan rotation (faster, less precision needed)
-FOREARM_ANGLE_DEG      =  -15  # shoulder_lift + elbow_flex sum kept constant during sweep
-TOLERANCE_PAN          =  0.55  # pan "close enough" threshold (°)
-TOLERANCE_DEG          =  0.1  # "at target" threshold for vertical moves (°)
-APPROACH_TOLERANCE_DEG =  0.55  # good-enough tolerance for approach / grasp poses
-GRIPPER_TOLERANCE_DEG  =  1.0  # tight tolerance for gripper open/close
+# ══════════════════════════════════════════════════════════════════════════════
+# HAND-SPECIFIC CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Gripper ───────────────────────────────────────────────────────────────────
-GRIPPER_DEFAULT_DEG = 17.3   # open / resting
-GRIPPER_CLOSED_DEG  =  3.5   # closed / grasping
+@dataclass
+class HandConfig:
+    """All parameters specific to one robotic arm."""
+    name: str
+    port: str
+    robot_id: str
 
-# ── Pick / place depth ────────────────────────────────────────────────────────
-TARGET_Z_DOWN = 0.065         # Z height (metres) to lower to for pick / place
+    # Hardware geometry (metres)
+    z_offset: float
+    l_upper: float
+    l_forearm: float
+    pan_x: float
+    pan_y: float
 
-# ── Fixed approach pose (pan is computed per-target) ─────────────────────────
-APPROACH_LIFT_DEG       = -38.0
-APPROACH_ELBOW_DEG      =  23.0
-APPROACH_WRIST_FLEX_DEG =  117
-APPROACH_WRIST_ROLL_DEG =  -1.0
+    # Angle references (degrees) — "straight up" calibration offsets
+    sh_vertical: float
+    el_vertical: float
+    pan_offset: float
 
-# ── Base / home pose ──────────────────────────────────────────────────────────
-GRASP_PAN_DEG        =  -4.1
-GRASP_LIFT_DEG       = -105.5
-GRASP_ELBOW_DEG      =   96.9
-GRASP_WRIST_FLEX_DEG = -102
-GRASP_WRIST_ROLL_DEG =   -1.0
+    # Safe initial pose — lift+elbow moved here before wrist rotation
+    safe_lift_deg: float
+    safe_elbow_deg: float
 
-# ── Board position map ────────────────────────────────────────────────────────
-# Run get_positions.py to generate this dict and paste the output here.
-# Keys are lowercase square names ("a1"…"h8"), values are (x, y, z) in metres.
-BOARD_POSITIONS = {
-    "a8": (0.1183, 0.0514, 0.2),
-    "b8": (0.1301, 0.0514, 0.2),
-    "c8": (0.182, 0.069, 0.2),
-    "d8": (0.2138, 0.0778, 0.2),
-    "e8": (0.2457, 0.0866, 0.2),
-    "f8": (0.2775, 0.0954, 0.2),
-    "g8": (0.3094, 0.1042, 0.2),
-    "h8": (0.3413, 0.113, 0.2),
+    # Fixed approach pose (pan is computed per-target)
+    approach_lift_deg: float
+    approach_elbow_deg: float
+    approach_wrist_flex_deg: float
+    approach_wrist_roll_deg: float
 
-    "a7": (0.1239, 0.0316, 0.2),
-    "b7": (0.155, 0.039, 0.2),
-    "c7": (0.1861, 0.0464, 0.2),
-    "d7": (0.2172, 0.0538, 0.2),
-    "e7": (0.2483, 0.0612, 0.2),
-    "f7": (0.2793, 0.0686, 0.2),
-    "g7": (0.3104, 0.076, 0.2),
-    "h7": (0.3415, 0.0834, 0.2),
+    # Base / home pose
+    grasp_pan_deg: float
+    grasp_lift_deg: float
+    grasp_elbow_deg: float
+    grasp_wrist_flex_deg: float
+    grasp_wrist_roll_deg: float
 
-    "a6": (0.1295, 0.0118, 0.2),
-    "b6": (0.1599, 0.0178, 0.2),
-    "c6": (0.1902, 0.0238, 0.2),
-    "d6": (0.2205, 0.0298, 0.2),
-    "e6": (0.2508, 0.0358, 0.2),
-    "f6": (0.2811, 0.0418, 0.2),
-    "g6": (0.3115, 0.0478, 0.2),
-    "h6": (0.3418, 0.0537, 0.2),
+    # Gripper
+    gripper_default_deg: float
+    gripper_closed_deg: float
 
-    "a5": (0.1352, -0.008, 0.2),
-    "b5": (0.1647, -0.0034, 0.2),
-    "c5": (0.1943, 0.0012, 0.2),
-    "d5": (0.2238, 0.0058, 0.2),
-    "e5": (0.2534, 0.0104, 0.2),
-    "f5": (0.2829, 0.0149, 0.2),
-    "g5": (0.3125, 0.0195, 0.2),
-    "h5": (0.342, 0.0241, 0.2),
+    # Pick / place depth
+    target_z_down: float
+    target_z_down_edge: float
+    edge_columns: tuple
 
-    "a4": (0.1408, -0.0278, 0.2),
-    "b4": (0.1696, -0.0246, 0.2),
-    "c4": (0.1984, -0.0214, 0.2),
-    "d4": (0.2272, -0.0182, 0.2),
-    "e4": (0.256, -0.0151, 0.2),
-    "f4": (0.2847, -0.0119, 0.2),
-    "g4": (0.3135, -0.0087, 0.2),
-    "h4": (0.3423, -0.0055, 0.2),
+    # Board positions  {square: (pan, lift, elbow, wrist_flex)}
+    board_positions: dict = field(default_factory=dict)
 
-    "a3": (0.1465, -0.0476, 0.2),
-    "b3": (0.1745, -0.0458, 0.2),
-    "c3": (0.2025, -0.044, 0.2),
-    "d3": (0.2305, -0.0423, 0.2),
-    "e3": (0.2585, -0.0405, 0.2),
-    "f3": (0.2865, -0.0387, 0.2),
-    "g3": (0.3146, -0.0369, 0.2),
-    "h3": (0.3426, -0.0351, 0.2),
+    # Per-hand coordinates file for persistence
+    coordinates_file: str = ""
 
-    "a2": (0.142, -0.048, 0.2),
-    "b2": (0.1794, -0.067, 0.2),
-    "c2": (0.2066, -0.0666, 0.2),
-    "d2": (0.2338, -0.0663, 0.2),
-    "e2": (0.2611, -0.0659, 0.2),
-    "f2": (0.2883, -0.0655, 0.2),
-    "g2": (0.3156, -0.0651, 0.2),
-    "h2": (0.3428, -0.0647, 0.2),
+    # Key in board_positions for the off-board drop spot (captures)
+    out_position: str = "out"
 
-    "a1": (0.114, -0.04, 0.2),
-    "b1": (0.114, -0.05, 0.2),
-    "c1": (0.210, -0.088, 0.2),
-    "d1": (0.198, -0.12, 0.2),
-    "e1": (0.231, -0.078, 0.2),
-    "f1": (0.254, -0.088, 0.2),
-    "g1": (0.282, -0.098, 0.2),
-    "h1": (0.310, -0.108, 0.2),
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HAND RUNTIME CLASS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Hand:
+    """Runtime wrapper: config + robot connection + commanded-state tracking."""
+
+    def __init__(self, config: HandConfig):
+        self.cfg   = config
+        self.robot = None
+        self._cmd  = {}
+
+    # ── connection ────────────────────────────────────────────────────────
+
+    def connect(self):
+        rc = SOFollowerRobotConfig(
+            port=self.cfg.port, id=self.cfg.robot_id,
+            calibration_dir=Path("."), use_degrees=True,
+        )
+        self.robot = SOFollower(rc)
+        self.robot.connect()
+        self._init_cmd()
+
+    def disconnect(self):
+        if self.robot:
+            self.robot.disconnect()
+
+    # ── commanded-state tracking ──────────────────────────────────────────
+
+    def _init_cmd(self):
+        """Seed _cmd from current obs on the first call."""
+        if not self._cmd and self.robot:
+            obs = self.robot.get_observation()
+            self._cmd = {k[:-4]: float(v) for k, v in obs.items()
+                         if k.endswith(".pos")}
+
+    def send_joints(self, **updates):
+        """Command joints; non-specified joints hold their last commanded value."""
+        self._cmd.update(updates)
+        self.robot.send_action({f"{k}.pos": v for k, v in self._cmd.items()})
+
+    def get_obs(self):
+        return self.robot.get_observation()
+
+    # ── forward kinematics (uses hand-specific geometry) ──────────────────
+
+    def _raw_to_rz(self, raw_sh, raw_el):
+        c     = self.cfg
+        alpha = math.radians(raw_sh - c.sh_vertical)
+        beta  = math.radians(raw_el - c.el_vertical)
+        gamma = alpha + beta
+        R = c.l_upper * math.sin(alpha) + c.l_forearm * math.sin(gamma)
+        Z = c.z_offset + c.l_upper * math.cos(alpha) + c.l_forearm * math.cos(gamma)
+        return R, Z
+
+    def get_xyz(self, raw_pan, raw_sh, raw_el):
+        c       = self.cfg
+        pan_rad = math.radians(-(raw_pan - c.pan_offset))
+        R, Z    = self._raw_to_rz(raw_sh, raw_el)
+        return (c.pan_x + R * math.cos(pan_rad),
+                c.pan_y + R * math.sin(pan_rad),
+                Z)
+
+    def solve_elbow_for_z(self, sh_deg, target_z):
+        """Find elbow angle (°) that places end-effector at target_z."""
+        c     = self.cfg
+        alpha = math.radians(sh_deg - c.sh_vertical)
+        cos_g = (target_z - c.z_offset - c.l_upper * math.cos(alpha)) / c.l_forearm
+        if abs(cos_g) > 1.0:
+            return None
+        gamma = math.acos(max(-1.0, min(1.0, cos_g)))
+        return math.degrees(gamma - alpha) + c.el_vertical
+
+    # ── coordinate persistence ────────────────────────────────────────────
+
+    def save_coordinates(self):
+        """Write board_positions to this hand's coordinates file."""
+        bp   = self.cfg.board_positions
+        rows = {}
+        for key in bp:
+            rows.setdefault(key[0], []).append(key)
+
+        lines = [f"# {self.cfg.name} board positions\n",
+                 "BOARD_POSITIONS = {\n"]
+        for grp in sorted(rows):
+            lines.append(f"    # Row {grp.upper()}\n")
+            for key in sorted(rows[grp]):
+                pan, sh, el, wf = bp[key]
+                lines.append(f'    "{key}": ({pan:.1f}, {sh:.1f}, {el:.1f}, {wf:.1f}),\n')
+            lines.append("\n")
+        lines.append("}\n")
+
+        with open(self.cfg.coordinates_file, "w") as f:
+            f.writelines(lines)
+
+    def load_coordinates(self):
+        """Read coordinates file and merge into board_positions."""
+        try:
+            text  = Path(self.cfg.coordinates_file).read_text()
+            start = text.index("{")
+            end   = text.rindex("}") + 1
+            loaded = ast.literal_eval(text[start:end])
+            self.cfg.board_positions.update(loaded)
+        except (FileNotFoundError, ValueError, SyntaxError):
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HAND 1  —  columns a, b, c, d  +  e3, e4, e5, e6
+# ══════════════════════════════════════════════════════════════════════════════
+
+HAND1_BOARD_POSITIONS = {
+    # Row A
+    "a1": (45.0, -5.6, 17.1, 104.9),
+    "a2": (31.5, -7.0, 18.6, 104.5),
+    "a3": (18.0, -8.5, 20.1, 104.0),
+    "a4": (4.5, -10.0, 21.6, 103.6),
+    "a5": (-9.0, -11.5, 23.1, 103.3),
+    "a6": (-22.5, -13.0, 24.6, 103.1),
+    "a7": (-37.5, -14.2, 26.0, 102.9),
+    "a8": (-59.0, -20.3, 14.3, 110.8),
+
+    # Row B
+    "b1": (38.6, 1.2, 7.5, 104.3),
+    "b2": (26.5, -0.3, 8.7, 103.9),
+    "b3": (14.5, -1.8, 10.0, 103.5),
+    "b4": (2.5, -3.3, 11.3, 103.1),
+    "b5": (-10.0, -4.8, 12.6, 102.9),
+    "b6": (-22.5, -6.3, 13.8, 102.8),
+    "b7": (-35.5, -7.8, 15.0, 102.8),
+    "b8": (-48.0, -9.0, 16.2, 102.8),
+
+    # Row C
+    "c1": (32.0, 7.0, -2.0, 103.8),
+    "c2": (20.0, 6.5, -1.5, 103.4),
+    "c3": (8.0, 6.0, -1.0, 103.2),
+    "c4": (-4.0, 5.5, -0.5, 103.0),
+    "c5": (-16.0, 5.0, 0.0, 102.9),
+    "c6": (-20.5, 4.5, 0.5, 102.8),
+    "c7": (-26.5, 4.0, 1.0, 102.8),
+    "c8": (-30.0, 3.5, 1.5, 102.8),
+
+    # Row D
+    "d1": (25.8, 13.5, -10.9, 103.4),
+    "d2": (17.0, 13.5, -10.9, 103.2),
+    "d3": (8.0, 13.5, -10.9, 103.0),
+    "d4": (-1.0, 13.5, -10.9, 102.9),
+    "d5": (-9.5, 13.5, -10.9, 102.8),
+    "d6": (-17.0, 13.5, -10.9, 102.8),
+    "d7": (-24.5, 13.5, -10.9, 102.8),
+    "d8": (-32.7, 13.5, -10.9, 102.8),
+
+    # Row E (only e3–e6 reachable by hand1)
+    "e3": (1.6, 19.9, -20.2, 102.5),
+    "e4": (-7.4, 19.9, -20.2, 102.4),
+    "e5": (-15.9, 19.9, -20.2, 102.3),
+    "e6": (-23.4, 19.9, -20.2, 102.3),
+
+    # Off-board drop position for captured pieces
+    "out": (60.0, -5.0, 17.0, 105.0),
 }
 
-# ── Forward kinematics ────────────────────────────────────────────────────────
-
-def _raw_to_rz(raw_sh, raw_el):
-    alpha = math.radians(raw_sh - SH_VERTICAL)
-    beta  = math.radians(raw_el - EL_VERTICAL)
-    gamma = alpha + beta
-    R = L_UPPER * math.sin(alpha) + L_FOREARM * math.sin(gamma)
-    Z = Z_OFFSET + L_UPPER * math.cos(alpha) + L_FOREARM * math.cos(gamma)
-    return R, Z
-
-def get_xyz(raw_pan, raw_sh, raw_el):
-    pan_rad = math.radians(-(raw_pan - PAN_OFFSET))
-    R, Z    = _raw_to_rz(raw_sh, raw_el)
-    return PAN_X + R * math.cos(pan_rad), PAN_Y + R * math.sin(pan_rad), Z
-
-
-# ── Target solvers ────────────────────────────────────────────────────────────
-
-def compute_pan(tx, ty):
-    return -math.degrees(math.atan2(ty - PAN_Y, tx - PAN_X)) + PAN_OFFSET
-
-
-def solve_shoulder_target(tx, ty, tz):
-    """Analytically find shoulder_lift for (tx,ty,tz) with sum constraint."""
-    gamma_c  = math.radians(FOREARM_ANGLE_DEG - SH_VERTICAL - EL_VERTICAL)
-    R_fore   = L_FOREARM * math.sin(gamma_c)
-    Z_fore   = L_FOREARM * math.cos(gamma_c)
-    R_target = math.sqrt((tx - PAN_X)**2 + (ty - PAN_Y)**2)
-    alpha    = math.atan2(R_target - R_fore, tz - Z_OFFSET - Z_fore)
-    sh       = math.degrees(alpha) + SH_VERTICAL
-    el       = FOREARM_ANGLE_DEG - sh
-    pan      = compute_pan(tx, ty)
-    px, py, pz = get_xyz(pan, sh, el)
-    residual = math.sqrt((px-tx)**2 + (py-ty)**2 + (pz-tz)**2)
-    return sh, el, residual
-
-
-def solve_elbow_for_z(sh_deg, target_z):
-    """
-    Find elbow_flex angle (°) that places the end-effector at target_z,
-    with shoulder_lift fixed.  Returns None if geometrically unreachable.
-    """
-    alpha  = math.radians(sh_deg - SH_VERTICAL)
-    cos_g  = (target_z - Z_OFFSET - L_UPPER * math.cos(alpha)) / L_FOREARM
-    if abs(cos_g) > 1.0:
-        return None
-    gamma  = math.acos(max(-1.0, min(1.0, cos_g)))
-    return math.degrees(gamma - alpha) + EL_VERTICAL
+HAND1_CONFIG = HandConfig(
+    name="hand1",
+    port="/dev/ttyACM4",
+    robot_id="follower1",
+    # Hardware geometry
+    z_offset=-0.0078,
+    l_upper=0.13,
+    l_forearm=0.14,
+    pan_x=0.08,
+    pan_y=0.0016,
+    # Angle references
+    sh_vertical=1.5,
+    el_vertical=-85.2,
+    pan_offset=-4.1,
+    # Safe pose
+    safe_lift_deg=-22.0,
+    safe_elbow_deg=22.5,
+    # Approach pose
+    approach_lift_deg=-38.0,
+    approach_elbow_deg=23.0,
+    approach_wrist_flex_deg=117.0,
+    approach_wrist_roll_deg=-1.0,
+    # Base / home pose
+    grasp_pan_deg=-4.1,
+    grasp_lift_deg=-105.5,
+    grasp_elbow_deg=96.9,
+    grasp_wrist_flex_deg=-102.0,
+    grasp_wrist_roll_deg=-1.0,
+    # Gripper
+    gripper_default_deg=19.0,
+    gripper_closed_deg=3.5,
+    # Pick / place depth
+    target_z_down=0.065,
+    target_z_down_edge=0.055,
+    edge_columns=('a', 'h'),
+    # Positions & persistence
+    board_positions=HAND1_BOARD_POSITIONS,
+    coordinates_file="coordinates_hand1.txt",
+    out_position="out",
+)
 
 
-# ── Commanded-state tracking ───────────────────────────────────────────────────
-# _cmd stores the last value we sent for every joint.
-# send_joints() uses _cmd for all joints not explicitly updated, so partial
-# commands (e.g. gripper only) truly hold every other joint in place.
+# ══════════════════════════════════════════════════════════════════════════════
+# HAND 2  —  columns e, f, g, h  +  d3, d4, d5, d6
+# ══════════════════════════════════════════════════════════════════════════════
 
-_cmd = {}
+# NOTE: All board positions below are PLACEHOLDERS (0,0,0,0).
+#       Run get_positions.py with hand2 connected to calibrate them,
+#       or use the interactive adjust mode.
 
-def _init_cmd(robot):
-    """Seed _cmd from current obs on the first call."""
-    global _cmd
-    if not _cmd:
-        obs  = robot.get_observation()
-        _cmd = {k[:-4]: float(v) for k, v in obs.items() if k.endswith(".pos")}
+HAND2_BOARD_POSITIONS = {
+    # Row D (only d3–d6 reachable by hand2)
+    "d3": (0.0, 0.0, 0.0, 0.0),
+    "d4": (0.0, 0.0, 0.0, 0.0),
+    "d5": (0.0, 0.0, 0.0, 0.0),
+    "d6": (0.0, 0.0, 0.0, 0.0),
 
-def send_joints(robot, **updates):
-    """
-    Command specific joints; all others hold their last commanded value.
-    Non-specified joints are NOT re-commanded from obs — they hold exactly
-    what was last sent, with no obs noise creeping in.
-    """
-    _cmd.update(updates)
-    robot.send_action({f"{k}.pos": v for k, v in _cmd.items()})
+    # Row E
+    "e1": (0.0, 0.0, 0.0, 0.0),
+    "e2": (0.0, 0.0, 0.0, 0.0),
+    "e3": (0.0, 0.0, 0.0, 0.0),
+    "e4": (0.0, 0.0, 0.0, 0.0),
+    "e5": (0.0, 0.0, 0.0, 0.0),
+    "e6": (0.0, 0.0, 0.0, 0.0),
+    "e7": (0.0, 0.0, 0.0, 0.0),
+    "e8": (0.0, 0.0, 0.0, 0.0),
+
+    # Row F
+    "f1": (0.0, 0.0, 0.0, 0.0),
+    "f2": (0.0, 0.0, 0.0, 0.0),
+    "f3": (0.0, 0.0, 0.0, 0.0),
+    "f4": (0.0, 0.0, 0.0, 0.0),
+    "f5": (0.0, 0.0, 0.0, 0.0),
+    "f6": (0.0, 0.0, 0.0, 0.0),
+    "f7": (0.0, 0.0, 0.0, 0.0),
+    "f8": (0.0, 0.0, 0.0, 0.0),
+
+    # Row G
+    "g1": (0.0, 0.0, 0.0, 0.0),
+    "g2": (0.0, 0.0, 0.0, 0.0),
+    "g3": (0.0, 0.0, 0.0, 0.0),
+    "g4": (0.0, 0.0, 0.0, 0.0),
+    "g5": (0.0, 0.0, 0.0, 0.0),
+    "g6": (0.0, 0.0, 0.0, 0.0),
+    "g7": (0.0, 0.0, 0.0, 0.0),
+    "g8": (0.0, 0.0, 0.0, 0.0),
+
+    # Row H
+    "h1": (0.0, 0.0, 0.0, 0.0),
+    "h2": (0.0, 0.0, 0.0, 0.0),
+    "h3": (0.0, 0.0, 0.0, 0.0),
+    "h4": (0.0, 0.0, 0.0, 0.0),
+    "h5": (0.0, 0.0, 0.0, 0.0),
+    "h6": (0.0, 0.0, 0.0, 0.0),
+    "h7": (0.0, 0.0, 0.0, 0.0),
+    "h8": (0.0, 0.0, 0.0, 0.0),
+
+    # Off-board drop position for captured pieces
+    "out": (0.0, 0.0, 0.0, 0.0),
+}
+
+HAND2_CONFIG = HandConfig(
+    name="hand2",
+    port="/dev/ttyACM5",
+    robot_id="follower2",
+    # Same default values as hand1 — update after calibrating hand2
+    z_offset=-0.0078,
+    l_upper=0.13,
+    l_forearm=0.14,
+    pan_x=0.08,
+    pan_y=0.0016,
+    sh_vertical=1.5,
+    el_vertical=-85.2,
+    pan_offset=-8.7,
+    safe_lift_deg=-22.0,
+    safe_elbow_deg=22.5,
+    approach_lift_deg=-38.0,
+    approach_elbow_deg=23.0,
+    approach_wrist_flex_deg=117.0,
+    approach_wrist_roll_deg=-1.0,
+    grasp_pan_deg=-4.1,
+    grasp_lift_deg=-104.3,
+    grasp_elbow_deg=95.6,
+    grasp_wrist_flex_deg=-102.0,
+    grasp_wrist_roll_deg=-1.0,
+    gripper_default_deg=19.0,
+    gripper_closed_deg=3.5,
+    target_z_down=0.065,
+    target_z_down_edge=0.055,
+    edge_columns=('a', 'h'),
+    board_positions=HAND2_BOARD_POSITIONS,
+    coordinates_file="coordinates_hand2.txt",
+    out_position="out",
+)
 
 
-# ── Unified step display ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SQUARE-TO-HAND ASSIGNMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _squares_for_columns(cols):
+    return {f"{c}{r}" for c in cols for r in "12345678"}
+
+HAND1_SQUARES = _squares_for_columns("abcd") | {"e3", "e4", "e5", "e6"}
+HAND2_SQUARES = _squares_for_columns("efgh") | {"d3", "d4", "d5", "d6"}
+TRANSFER_SQUARES = sorted(HAND1_SQUARES & HAND2_SQUARES)
+# → ['d3','d4','d5','d6','e3','e4','e5','e6']
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BOARD STATE TRACKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def initial_board_state():
+    """Return a set of occupied squares for the standard chess starting position."""
+    occ = set()
+    for col in "abcdefgh":
+        for row in "12":
+            occ.add(f"{col}{row}")
+        for row in "78":
+            occ.add(f"{col}{row}")
+    return occ
+
+
+def find_free_transfer_square(occupied, src_hand, dst_hand):
+    """Return the first transfer square that is empty AND calibrated in both hands."""
+    for sq in TRANSFER_SQUARES:
+        if sq not in occupied:
+            if sq in src_hand.cfg.board_positions and sq in dst_hand.cfg.board_positions:
+                return sq
+    return None
+
+
+def print_board(occupied):
+    """Print a simple text representation of the board state."""
+    print("\n     a  b  c  d  e  f  g  h")
+    print("   +------------------------+")
+    for row in "87654321":
+        pieces = []
+        for col in "abcdefgh":
+            sq = f"{col}{row}"
+            pieces.append(" ■ " if sq in occupied else " · ")
+        print(f" {row} |{''.join(pieces)}|")
+    print("   +------------------------+")
+    print(f"   Occupied: {len(occupied)} squares\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPLAY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _print_step_table(joints, extra=None):
-    """
-    joints: list of dicts — name, actual, commanded, target, step
-    extra:  optional extra line printed below the table (e.g. Z prediction)
-    """
+    """Pretty-print a step status table for one or more joints."""
     w = 9
-    print(f"\n  {'Joint':<20} {'Actual':>{w}} {'Commanded':>{w+1}} {'Target':>{w}} {'Remaining':>{w+1}} {'Step':>{w+1}}")
+    print(f"\n  {'Joint':<20} {'Actual':>{w}} {'Commanded':>{w+1}} "
+          f"{'Target':>{w}} {'Remaining':>{w+1}} {'Step':>{w+1}}")
     print(f"  {'-'*74}")
     for j in joints:
         rem  = j['target'] - j['commanded']
@@ -232,35 +562,47 @@ def _print_step_table(joints, extra=None):
         print(f"  {extra}")
 
 
-# ── Step-to-pose (any set of joints) ──────────────────────────────────────────
+def _getch():
+    """Read a single character from stdin without requiring Enter."""
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
 
-def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOVEMENT PRIMITIVES — all take a Hand instance as first argument
+# ══════════════════════════════════════════════════════════════════════════════
+
+def step_to_pose(hand, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
                  step_deg=STEP_DEG, wait_sec=STEP_WAIT_SEC):
     """
     Move joints in `targets` {name: deg} step-by-step with timed pauses.
     Lead joint (largest Δ) takes step_deg; others scale proportionally.
     Only the joints listed in targets are moved; all others hold via _cmd.
     """
-    _init_cmd(robot)
-    obs       = robot.get_observation()
-    # Seed from last commanded value (not obs) so the step calculation is
-    # based on what we actually sent, not the potentially noisy sensor reading.
-    commanded = {n: _cmd.get(n, float(obs[f"{n}.pos"])) for n in targets}
-    print(f"\n--- {label} ---")
+    hand._init_cmd()
+    obs       = hand.get_obs()
+    commanded = {n: hand._cmd.get(n, float(obs[f"{n}.pos"])) for n in targets}
+    print(f"\n--- [{hand.cfg.name}] {label} ---")
     while True:
         remaining = {n: targets[n] - commanded[n] for n in targets}
         max_rem   = max(abs(v) for v in remaining.values())
         if max_rem <= tol:
             print("  All joints at target.")
             return True
-        scale  = min(1.0, step_deg / max_rem)
-        steps  = {}
+        scale = min(1.0, step_deg / max_rem)
+        steps = {}
         for n in targets:
             s     = remaining[n] * scale
-            abs_s = max(MIN_STEP_DEG, abs(s))          # enforce minimum
-            abs_s = min(abs_s, abs(remaining[n]))      # but never overshoot
+            abs_s = max(MIN_STEP_DEG, abs(s))
+            abs_s = min(abs_s, abs(remaining[n]))
             steps[n] = math.copysign(abs_s, remaining[n])
-        obs    = robot.get_observation()
+        obs    = hand.get_obs()
         actual = {n: float(obs[f"{n}.pos"]) for n in targets}
         _print_step_table([
             dict(name=n, actual=actual[n], commanded=commanded[n],
@@ -269,76 +611,69 @@ def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
         ])
         time.sleep(wait_sec)
         new_vals  = {n: commanded[n] + steps[n] for n in targets}
-        send_joints(robot, **new_vals)
+        hand.send_joints(**new_vals)
         commanded = new_vals
 
 
-# ── Vertical movement (elbow + wrist_flex only) ────────────────────────────────
-
-def go_vertical(robot, pan_deg, sh_deg, target_el, label="Vertical"):
+def go_vertical(hand, pan_deg, sh_deg, target_el, label="Vertical"):
     """
     Lower or raise arm by stepping elbow toward target_el.
     wrist_flex compensates by -Δelbow each step (gripper keeps orientation).
-    Only elbow_flex and wrist_flex are moved; all other joints hold via _cmd.
-    Returns history: list of (el, wf) starting from initial position,
-    suitable for passing to go_vertical_reverse.
+    Returns history list for go_vertical_reverse.
     """
-    _init_cmd(robot)
-    obs          = robot.get_observation()
+    hand._init_cmd()
+    obs          = hand.get_obs()
     commanded_el = float(obs["elbow_flex.pos"])
     commanded_wf = float(obs["wrist_flex.pos"])
     target_wf    = commanded_wf - (target_el - commanded_el)
     history      = [(commanded_el, commanded_wf)]
-    print(f"\n--- {label} ---")
+    print(f"\n--- [{hand.cfg.name}] {label} ---")
     while True:
         remaining_el = target_el - commanded_el
         if abs(remaining_el) < TOLERANCE_DEG:
-            obs = robot.get_observation()
-            cz  = get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
+            obs = hand.get_obs()
+            cz  = hand.get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
             print(f"  Done.  Z = {cz:.3f} m")
             return history
         abs_step = min(STEP_DEG_DOWN, abs(remaining_el))
-        abs_step = max(MIN_STEP_DEG, abs_step)         # enforce minimum
-        abs_step = min(abs_step, abs(remaining_el))    # but never overshoot
+        abs_step = max(MIN_STEP_DEG, abs_step)
+        abs_step = min(abs_step, abs(remaining_el))
         step_el  = math.copysign(abs_step, remaining_el)
         new_el   = commanded_el + step_el
         new_wf   = commanded_wf - step_el
-        obs      = robot.get_observation()
+        obs      = hand.get_obs()
         act_el   = float(obs["elbow_flex.pos"])
         act_wf   = float(obs["wrist_flex.pos"])
-        curr_z   = get_xyz(pan_deg, sh_deg, act_el)[2]
-        after_z  = get_xyz(pan_deg, sh_deg, new_el)[2]
+        curr_z   = hand.get_xyz(pan_deg, sh_deg, act_el)[2]
+        after_z  = hand.get_xyz(pan_deg, sh_deg, new_el)[2]
         _print_step_table([
             dict(name="elbow_flex", actual=act_el, commanded=commanded_el,
                  target=target_el, step=step_el),
             dict(name="wrist_flex", actual=act_wf, commanded=commanded_wf,
                  target=target_wf, step=-step_el),
-        ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m  (target {TARGET_Z_DOWN:+.3f} m)")
+        ], extra=(f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m  "
+                  f"(target {hand.get_xyz(pan_deg, sh_deg, target_el)[2]:+.3f} m)"))
         time.sleep(STEP_WAIT_DOWN_SEC)
-        send_joints(robot, elbow_flex=new_el, wrist_flex=new_wf)
+        hand.send_joints(elbow_flex=new_el, wrist_flex=new_wf)
         commanded_el = new_el
         commanded_wf = new_wf
         history.append((commanded_el, commanded_wf))
 
 
-def go_vertical_reverse(robot, pan_deg, sh_deg, history, label="Vertical (reversed)"):
-    """
-    Raise arm back to the position recorded before descent (history[0]).
-    Steps by STEP_DEG_UP; wrist_flex tracks elbow linearly (same coupling as descent).
-    Only elbow_flex and wrist_flex move; all other joints hold via _cmd.
-    """
+def go_vertical_reverse(hand, pan_deg, sh_deg, history, label="Vertical (reversed)"):
+    """Raise arm back to the position recorded before descent (history[0])."""
     if len(history) < 2:
         return
-    start_el, start_wf = history[0]   # target = position before descent
-    _init_cmd(robot)
-    commanded_el = _cmd.get("elbow_flex", start_el)
-    commanded_wf = _cmd.get("wrist_flex", start_wf)
-    print(f"\n--- {label} ---")
+    start_el, start_wf = history[0]
+    hand._init_cmd()
+    commanded_el = hand._cmd.get("elbow_flex", start_el)
+    commanded_wf = hand._cmd.get("wrist_flex", start_wf)
+    print(f"\n--- [{hand.cfg.name}] {label} ---")
     while True:
         remaining_el = start_el - commanded_el
         if abs(remaining_el) < TOLERANCE_DEG:
-            obs = robot.get_observation()
-            cz  = get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
+            obs = hand.get_obs()
+            cz  = hand.get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
             print(f"  Done.  Z = {cz:.3f} m")
             return
         abs_step = min(STEP_DEG_UP, abs(remaining_el))
@@ -347,11 +682,11 @@ def go_vertical_reverse(robot, pan_deg, sh_deg, history, label="Vertical (revers
         step_el  = math.copysign(abs_step, remaining_el)
         new_el   = commanded_el + step_el
         new_wf   = start_wf - (new_el - start_el)
-        obs      = robot.get_observation()
+        obs      = hand.get_obs()
         act_el   = float(obs["elbow_flex.pos"])
         act_wf   = float(obs["wrist_flex.pos"])
-        curr_z   = get_xyz(pan_deg, sh_deg, act_el)[2]
-        after_z  = get_xyz(pan_deg, sh_deg, new_el)[2]
+        curr_z   = hand.get_xyz(pan_deg, sh_deg, act_el)[2]
+        after_z  = hand.get_xyz(pan_deg, sh_deg, new_el)[2]
         _print_step_table([
             dict(name="elbow_flex", actual=act_el, commanded=commanded_el,
                  target=start_el, step=step_el),
@@ -359,82 +694,54 @@ def go_vertical_reverse(robot, pan_deg, sh_deg, history, label="Vertical (revers
                  target=start_wf, step=-step_el),
         ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m")
         time.sleep(STEP_WAIT_UP_SEC)
-        send_joints(robot, elbow_flex=new_el, wrist_flex=new_wf)
+        hand.send_joints(elbow_flex=new_el, wrist_flex=new_wf)
         commanded_el = new_el
         commanded_wf = new_wf
 
 
 # ── Phases 1-3 helper ─────────────────────────────────────────────────────────
 
-def move_to_xyz(robot, tx, ty, tz, prefix="", skip_approach=False):
+def move_to_angles(hand, pan_deg, sh_deg, el_deg, wf_deg, prefix=""):
     """
-    Run phases 1-3 (pan align → approach pose → shoulder sweep) to reach (tx,ty,tz).
-    skip_approach=True skips Phase 2 and sweeps directly from the current shoulder
-    position — use this when the arm is already in approach configuration (e.g. after
-    pick, before drop).  All non-pan/shoulder joints hold their current commanded value.
-    Returns (pan_deg, commanded_sh) on success, None if user cancelled.
+    Move arm to a board square specified by direct joint angles.
+    Phase 1 — pan to pan_deg.
+    Phase 2 — sweep shoulder to sh_deg, elbow tracks sh+el=FOREARM_ANGLE_DEG.
+    Phase 3 — fine-tune elbow and wrist_flex to exact target angles.
     """
-    _init_cmd(robot)
-    pan_deg = compute_pan(tx, ty)
-    shoulder_target, elbow_target, ik_err = solve_shoulder_target(tx, ty, tz)
-
+    hand._init_cmd()
     print(f"\n{'='*60}")
-    print(f"  {prefix} Target XYZ   : X={tx:.3f}  Y={ty:.3f}  Z={tz:.3f}")
-    print(f"  Computed pan   : {pan_deg:.1f}°  (offset {PAN_OFFSET:+.1f}°)")
-    print(f"  Target shoulder: {shoulder_target:.1f}°   elbow: {elbow_target:.1f}°"
-          f"  (sum={shoulder_target+elbow_target:.1f}°)")
-    print(f"  IK residual    : {ik_err*1000:.1f} mm")
+    print(f"  [{hand.cfg.name}] {prefix} Target angles:"
+          f"  pan={pan_deg:.1f}°  sh={sh_deg:.1f}°  el={el_deg:.1f}°  wf={wf_deg:.1f}°")
 
-    # ── Phase 1: align pan ────────────────────────────────────────────────────
-    print(f"\n--- {prefix} Phase 1: Align pan → {pan_deg:.1f}° ---")
+    # ── Phase 1: align pan ────────────────────────────────────────────────
+    print(f"\n--- [{hand.cfg.name}] {prefix} Phase 1: Align pan → {pan_deg:.1f}° ---")
     while True:
-        obs      = robot.get_observation()
+        obs      = hand.get_obs()
         curr_pan = float(obs["shoulder_pan.pos"])
-        curr_sh  = float(obs["shoulder_lift.pos"])
-        curr_el  = float(obs["elbow_flex.pos"])
-        cx, cy, cz = get_xyz(curr_pan, curr_sh, curr_el)
-        diff_pan   = pan_deg - curr_pan
-        print(f"\n  [TARGET  POS]  X:{tx:+.3f}  Y:{ty:+.3f}  Z:{tz:+.3f}")
-        print(f"  [CURRENT POS]  X:{cx:+.3f}  Y:{cy:+.3f}  Z:{cz:+.3f}")
+        diff_pan = pan_deg - curr_pan
         if abs(diff_pan) <= TOLERANCE_PAN:
             print("  Pan aligned.")
             break
         step_pan = math.copysign(min(PAN_STEP_DEG, abs(diff_pan)), diff_pan)
         _print_step_table([
             dict(name="shoulder_pan", actual=curr_pan,
-                 commanded=_cmd.get("shoulder_pan", curr_pan),
+                 commanded=hand._cmd.get("shoulder_pan", curr_pan),
                  target=pan_deg, step=step_pan),
         ])
         time.sleep(STEP_WAIT_SEC)
-        send_joints(robot, shoulder_pan=curr_pan + step_pan)
+        hand.send_joints(shoulder_pan=curr_pan + step_pan)
 
-    # ── Phase 2: approach pose (skipped when already in approach config) ──────
-    if not skip_approach:
-        if not step_to_pose(robot, {
-                "shoulder_pan":  pan_deg,
-                "shoulder_lift": APPROACH_LIFT_DEG,
-                "elbow_flex":    APPROACH_ELBOW_DEG,
-                "wrist_flex":    APPROACH_WRIST_FLEX_DEG,
-                "wrist_roll":    APPROACH_WRIST_ROLL_DEG,
-                "gripper":       GRIPPER_DEFAULT_DEG,
-            }, label=f"{prefix} Phase 2: Approach pose"):
-            return None
-
-    # ── Phase 3: sweep shoulder/elbow to target ───────────────────────────────
-    # Start from current commanded shoulder (either APPROACH_LIFT_DEG after Phase 2,
-    # or wherever the arm currently is when skipping Phase 2).
-    obs = robot.get_observation()
-    commanded_sh = _cmd.get("shoulder_lift", float(obs["shoulder_lift.pos"]))
-    commanded_el = _cmd.get("elbow_flex",    float(obs["elbow_flex.pos"]))
-    print(f"\n--- {prefix} Phase 3: Sweep shoulder {commanded_sh:.1f}° → {shoulder_target:.1f}° ---")
+    # ── Phase 2: sweep shoulder (elbow maintains sum constraint) ──────────
+    obs          = hand.get_obs()
+    commanded_sh = hand._cmd.get("shoulder_lift", float(obs["shoulder_lift.pos"]))
+    commanded_el = hand._cmd.get("elbow_flex",    float(obs["elbow_flex.pos"]))
+    el_at_target = FOREARM_ANGLE_DEG - sh_deg
+    print(f"\n--- [{hand.cfg.name}] {prefix} Phase 2: Sweep shoulder "
+          f"{commanded_sh:.1f}° → {sh_deg:.1f}° ---")
     while True:
-        remaining = shoulder_target - commanded_sh
+        remaining = sh_deg - commanded_sh
         if abs(remaining) <= TOLERANCE_DEG:
-            obs = robot.get_observation()
-            cx, cy, cz = get_xyz(pan_deg, float(obs["shoulder_lift.pos"]),
-                                 float(obs["elbow_flex.pos"]))
-            err_mm = math.sqrt((cx-tx)**2+(cy-ty)**2+(cz-tz)**2)*1000.0
-            print(f"\n  At target.  [FINAL POS]  X:{cx:+.3f}  Y:{cy:+.3f}  Z:{cz:+.3f}  (err {err_mm:.1f} mm)")
+            print("  Shoulder at target.")
             break
         abs_step = min(STEP_DEG, abs(remaining))
         abs_step = max(MIN_STEP_DEG, abs_step)
@@ -443,144 +750,344 @@ def move_to_xyz(robot, tx, ty, tz, prefix="", skip_approach=False):
         new_sh   = commanded_sh + step_sh
         new_el   = FOREARM_ANGLE_DEG - new_sh
         step_el  = new_el - commanded_el
-        obs      = robot.get_observation()
+        obs      = hand.get_obs()
         act_sh   = float(obs["shoulder_lift.pos"])
         act_el   = float(obs["elbow_flex.pos"])
-        cx, cy, cz = get_xyz(pan_deg, act_sh, act_el)
-        err_mm   = math.sqrt((cx-tx)**2+(cy-ty)**2+(cz-tz)**2)*1000.0
-        print(f"\n  [TARGET  POS]  X:{tx:+.3f}  Y:{ty:+.3f}  Z:{tz:+.3f}")
-        print(f"  [CURRENT POS]  X:{cx:+.3f}  Y:{cy:+.3f}  Z:{cz:+.3f}  (err {err_mm:.1f} mm)")
         _print_step_table([
             dict(name="shoulder_lift", actual=act_sh, commanded=commanded_sh,
-                 target=shoulder_target, step=step_sh),
+                 target=sh_deg, step=step_sh),
             dict(name="elbow_flex",    actual=act_el, commanded=commanded_el,
-                 target=elbow_target,   step=step_el),
-        ], extra=f"sum after step: {new_sh:.2f}° + {new_el:.2f}° = {new_sh+new_el:.2f}°"
-                 f"  (target {FOREARM_ANGLE_DEG}°)")
+                 target=el_at_target,  step=step_el),
+        ], extra=(f"sum after step: {new_sh:.2f}° + {new_el:.2f}° = "
+                  f"{new_sh + new_el:.2f}°  (constraint {FOREARM_ANGLE_DEG}°)"))
         time.sleep(STEP_WAIT_SEC)
-        send_joints(robot, shoulder_lift=new_sh, elbow_flex=new_el)
+        hand.send_joints(shoulder_lift=new_sh, elbow_flex=new_el)
         commanded_sh = new_sh
         commanded_el = new_el
 
-    return pan_deg, commanded_sh
+    # ── Phase 3: fine-tune elbow and wrist ────────────────────────────────
+    step_to_pose(hand, {"elbow_flex": el_deg, "wrist_flex": wf_deg},
+                 label=f"{prefix} Phase 3: Adjust elbow + wrist")
 
 
-def parse_xyz(prompt):
-    """Ask user for X Y Z; returns (x,y,z) or None on quit/bad input."""
-    raw = input(prompt).strip()
-    if raw.lower() == 'q':
-        return None
-    parts = raw.split()
-    if len(parts) != 3:
-        print("  Need exactly 3 values.")
-        return None
-    try:
-        return float(parts[0]), float(parts[1]), float(parts[2])
-    except ValueError:
-        print("  Invalid numbers.")
-        return None
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE ADJUSTMENT
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def parse_move(prompt):
+def adjust_position_interactive(hand, square, pan_deg, sh_deg, el_deg, wf_deg):
     """
-    Accept a chess move like 'd2 d4'; looks up coordinates in BOARD_POSITIONS.
-    Returns ((x1,y1,z1), (x2,y2,z2)) or None on quit / unknown square.
+    Interactive fine-tuning of a hover position.
+
+    Keys (each nudges ADJUST_STEP_DEG):
+      p / o  →  pan  +/-
+      l / k  →  lift +/-
+      e / w  →  elbow +/-
+      j / h  →  wrist +/-
+    Enter  →  confirm & save.   Ctrl+C → cancel & revert.
     """
-    raw = input(prompt).strip().lower()
-    if raw == 'q':
-        return None
-    parts = raw.split()
-    if len(parts) != 2:
-        print("  Need two squares, e.g. 'd2 d4'")
-        return None
-    src, dst = parts
-    missing = [s for s in (src, dst) if s not in BOARD_POSITIONS]
-    if missing:
-        print(f"  Unknown square(s): {missing}  — run get_positions.py first")
-        return None
-    return BOARD_POSITIONS[src], BOARD_POSITIONS[dst]
+    pan, sh, el, wf = pan_deg, sh_deg, el_deg, wf_deg
+
+    KEY_DELTAS = {
+        'p': ('shoulder_pan',  +ADJUST_STEP_DEG),
+        'o': ('shoulder_pan',  -ADJUST_STEP_DEG),
+        'l': ('shoulder_lift', +ADJUST_STEP_DEG),
+        'k': ('shoulder_lift', -ADJUST_STEP_DEG),
+        'e': ('elbow_flex',    +ADJUST_STEP_DEG),
+        'w': ('elbow_flex',    -ADJUST_STEP_DEG),
+        'j': ('wrist_flex',    +ADJUST_STEP_DEG),
+        'h': ('wrist_flex',    -ADJUST_STEP_DEG),
+    }
+
+    print(f"\n  [{hand.cfg.name}] Adjust '{square}':"
+          f"  p/o=pan  l/k=lift  e/w=elbow  j/h=wrist"
+          f"  (Enter=save  Ctrl+C=cancel)")
+
+    def _show():
+        print(f"\r    pan={pan:+.1f}°  lift={sh:+.1f}°  elbow={el:+.1f}°"
+              f"  wrist={wf:+.1f}°   ", end='', flush=True)
+
+    _show()
+
+    while True:
+        ch = _getch()
+
+        if ch in ('\r', '\n'):
+            print()
+            print(f"  '{square}' confirmed:"
+                  f" pan={pan:.1f}  lift={sh:.1f}  elbow={el:.1f}  wrist={wf:.1f}")
+            return pan, sh, el, wf
+
+        if ch == '\x03':
+            print("\n  Adjustment cancelled — reverting to original angles.")
+            hand.cfg.board_positions[square] = (pan_deg, sh_deg, el_deg, wf_deg)
+            hand.save_coordinates()
+            return pan_deg, sh_deg, el_deg, wf_deg
+
+        if ch not in KEY_DELTAS:
+            continue
+
+        joint, delta = KEY_DELTAS[ch]
+        if   joint == 'shoulder_pan':  pan += delta
+        elif joint == 'shoulder_lift': sh  += delta
+        elif joint == 'elbow_flex':    el  += delta
+        elif joint == 'wrist_flex':    wf  += delta
+
+        hand.cfg.board_positions[square] = (pan, sh, el, wf)
+        hand.save_coordinates()
+
+        hand.send_joints(shoulder_pan=pan, shoulder_lift=sh,
+                         elbow_flex=el, wrist_flex=wf)
+        _show()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PICK-AND-PLACE — full sequence for one hand
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pick_and_place(hand, src_sq, dst_sq, adjust_pick=False, adjust_drop=False):
+    """
+    Full pick-and-place cycle:
+      safe → approach → pick → lift → approach → drop → lift → base.
+    Returns True on success, False if a position is unreachable.
+    """
+    bp  = hand.cfg.board_positions
+    cfg = hand.cfg
+
+    pan1, sh1, el1, wf1 = bp[src_sq]
+    pan2, sh2, el2, wf2 = bp[dst_sq]
+
+    # ── 1. Safe pose + open gripper ───────────────────────────────────────
+    step_to_pose(hand, {
+        "shoulder_lift": cfg.safe_lift_deg,
+        "elbow_flex":    cfg.safe_elbow_deg,
+        "gripper":       cfg.gripper_default_deg,
+    }, label="Safe pose + gripper open", tol=GRIPPER_TOLERANCE_DEG)
+
+    # ── 2. Rotate wrist down ─────────────────────────────────────────────
+    step_to_pose(hand, {"wrist_flex": cfg.approach_wrist_flex_deg},
+                 label="Wrist down")
+
+    # ── 3. Raise to full approach height ─────────────────────────────────
+    step_to_pose(hand, {
+        "shoulder_lift": cfg.approach_lift_deg,
+        "elbow_flex":    cfg.approach_elbow_deg,
+    }, label="Raise to approach height")
+
+    # ── 4. Move to pick position ─────────────────────────────────────────
+    move_to_angles(hand, pan1, sh1, el1, wf1, prefix="[PICK]")
+
+    # ── Optional: fine-tune pick position ─────────────────────────────────
+    if adjust_pick:
+        ans = input(f"\nAdjust pick position at '{src_sq}'? (y/n): ").strip().lower()
+        if ans == 'y':
+            pan1, sh1, el1, wf1 = adjust_position_interactive(
+                hand, src_sq, pan1, sh1, el1, wf1)
+
+    # ── 5. Go down at pick position ──────────────────────────────────────
+    z_down1  = cfg.target_z_down_edge if src_sq[0] in cfg.edge_columns else cfg.target_z_down
+    el_down1 = hand.solve_elbow_for_z(sh1, z_down1)
+    if el_down1 is None:
+        print(f"  Z={z_down1} m unreachable from sh={sh1:.1f}° — skip.")
+        return False
+    down_history1 = go_vertical(hand, pan1, sh1, el_down1, label="Go down (pick)")
+
+    # ── 6. Close gripper ─────────────────────────────────────────────────
+    step_to_pose(hand, {"gripper": cfg.gripper_closed_deg},
+                 label="Close gripper", tol=GRIPPER_TOLERANCE_DEG,
+                 step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
+
+    # ── 7. Go back up ────────────────────────────────────────────────────
+    go_vertical_reverse(hand, pan1, sh1, down_history1, label="Go up (pick)")
+
+    # ── 8. Raise to approach height before panning to drop ───────────────
+    step_to_pose(hand, {
+        "shoulder_lift": cfg.approach_lift_deg,
+        "elbow_flex":    cfg.approach_elbow_deg,
+    }, label="Raise to approach height")
+
+    # ── 9. Move to drop position ─────────────────────────────────────────
+    move_to_angles(hand, pan2, sh2, el2, wf2, prefix="[DROP]")
+
+    # ── Optional: fine-tune drop position ─────────────────────────────────
+    if adjust_drop:
+        ans = input(f"\nAdjust drop position at '{dst_sq}'? (y/n): ").strip().lower()
+        if ans == 'y':
+            pan2, sh2, el2, wf2 = adjust_position_interactive(
+                hand, dst_sq, pan2, sh2, el2, wf2)
+
+    # ── 10. Go down at drop position ─────────────────────────────────────
+    z_down2  = cfg.target_z_down_edge if dst_sq[0] in cfg.edge_columns else cfg.target_z_down
+    el_down2 = hand.solve_elbow_for_z(sh2, z_down2)
+    if el_down2 is None:
+        print(f"  Z={z_down2} m unreachable from sh={sh2:.1f}° — skip.")
+        return False
+    down_history2 = go_vertical(hand, pan2, sh2, el_down2, label="Go down (drop)")
+
+    # ── 11. Open gripper ─────────────────────────────────────────────────
+    step_to_pose(hand, {"gripper": cfg.gripper_default_deg},
+                 label="Open gripper", tol=GRIPPER_TOLERANCE_DEG,
+                 step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
+
+    # ── 12. Go back up ───────────────────────────────────────────────────
+    go_vertical_reverse(hand, pan2, sh2, down_history2, label="Go up (drop)")
+
+    # ── 13. Return to base pose ──────────────────────────────────────────
+    step_to_pose(hand, {
+        "shoulder_pan":  cfg.grasp_pan_deg,
+        "shoulder_lift": cfg.grasp_lift_deg,
+        "elbow_flex":    cfg.grasp_elbow_deg,
+        "wrist_flex":    cfg.grasp_wrist_flex_deg,
+        "wrist_roll":    cfg.grasp_wrist_roll_deg,
+        "gripper":       cfg.gripper_default_deg,
+    }, label="Return to base")
+
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    config = SOFollowerRobotConfig(port=PORT, id=ROBOT_ID, calibration_dir=Path("."), use_degrees=True)
-    robot  = SOFollower(config)
-    robot.connect()
-    _init_cmd(robot)
+    # ── Create hand objects ───────────────────────────────────────────────
+    hand1 = Hand(HAND1_CONFIG)
+    hand2 = Hand(HAND2_CONFIG)
+
+    # Load saved calibrations (overrides the hardcoded defaults above)
+    hand1.load_coordinates()
+    hand2.load_coordinates()
+
+    # Connect both arms
+    hand1.connect()
+    hand2.connect()
+
+    # Board state — standard chess starting position
+    occupied = initial_board_state()
 
     try:
         while True:
-            # ── Get move from chess notation ──────────────────────────────────
-            print("\n" + "="*60)
-            move = parse_move("Enter move (e.g. 'd2 d4', or 'q' to quit): ")
-            if move is None:
+            # ── Prompt ────────────────────────────────────────────────────
+            print("\n" + "=" * 60)
+            raw = input("Enter move (e.g. 'd2 d4'), 'b'=board, 'r'=reset, 'q'=quit: ").strip().lower()
+
+            if raw == 'q':
                 break
-            (tx1, ty1, tz1), (tx2, ty2, tz2) = move
-
-            # ── Move to pick position ─────────────────────────────────────────
-            result = move_to_xyz(robot, tx1, ty1, tz1, prefix="[PICK]")
-            if result is None:
+            if raw == 'b':
+                print_board(occupied)
                 continue
-            pan1, sh1 = result
-
-            # ── Go down at pick position ──────────────────────────────────────
-            el_down1 = solve_elbow_for_z(sh1, TARGET_Z_DOWN)
-            if el_down1 is None:
-                print(f"  Z={TARGET_Z_DOWN} m unreachable from this shoulder angle — skip.")
+            if raw == 'r':
+                occupied = initial_board_state()
+                print("  Board reset to starting position.")
                 continue
-            down_history1 = go_vertical(robot, pan1, sh1, el_down1, label="Go down (pick)")
 
-            # ── Close gripper ─────────────────────────────────────────────────
-            step_to_pose(robot, {"gripper": GRIPPER_CLOSED_DEG},
-                         label="Close gripper", tol=GRIPPER_TOLERANCE_DEG,
-                         step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
-
-            # ── Go back up — exact reverse of the descent ─────────────────────
-            go_vertical_reverse(robot, pan1, sh1, down_history1, label="Go up (pick)")
-
-            # ── Raise to approach height before panning (safe for rotation) ─────
-            # This ensures FOREARM_ANGLE_DEG condition and safe height regardless
-            # of where sh1 landed.
-            step_to_pose(robot, {
-                "shoulder_lift": APPROACH_LIFT_DEG,
-                "elbow_flex":    APPROACH_ELBOW_DEG,
-            }, label="Raise to approach height")
-
-            # ── Move to drop position (arm already in approach config) ──────────
-            result2 = move_to_xyz(robot, tx2, ty2, tz2, prefix="[DROP]", skip_approach=True)
-            if result2 is None:
+            parts = raw.split()
+            if len(parts) != 2:
+                print("  Need two squares, e.g. 'd2 d4'")
                 continue
-            pan2, sh2 = result2
 
-            # ── Go down at drop position ──────────────────────────────────────
-            el_down2 = solve_elbow_for_z(sh2, TARGET_Z_DOWN)
-            if el_down2 is None:
-                print(f"  Z={TARGET_Z_DOWN} m unreachable from this shoulder angle — skip.")
+            src, dst = parts
+
+            # ── Validate squares ──────────────────────────────────────────
+            all_squares = HAND1_SQUARES | HAND2_SQUARES
+            missing = [s for s in (src, dst) if s not in all_squares]
+            if missing:
+                print(f"  Unknown square(s): {missing}")
                 continue
-            down_history2 = go_vertical(robot, pan2, sh2, el_down2, label="Go down (drop)")
 
-            # ── Open gripper ──────────────────────────────────────────────────
-            step_to_pose(robot, {"gripper": GRIPPER_DEFAULT_DEG},
-                         label="Open gripper", tol=GRIPPER_TOLERANCE_DEG,
-                         step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
+            is_capture = dst in occupied
 
-            # ── Go back up — exact reverse of the descent ─────────────────────
-            go_vertical_reverse(robot, pan2, sh2, down_history2, label="Go up (drop)")
+            # ── Determine hand assignment ─────────────────────────────────
+            h1_src = src in HAND1_SQUARES
+            h1_dst = dst in HAND1_SQUARES
+            h2_src = src in HAND2_SQUARES
+            h2_dst = dst in HAND2_SQUARES
 
-            # ── Return to base pose ───────────────────────────────────────────
-            step_to_pose(robot, {
-                "shoulder_pan":  GRASP_PAN_DEG,
-                "shoulder_lift": GRASP_LIFT_DEG,
-                "elbow_flex":    GRASP_ELBOW_DEG,
-                "wrist_flex":    GRASP_WRIST_FLEX_DEG,
-                "wrist_roll":    GRASP_WRIST_ROLL_DEG,
-                "gripper":       GRIPPER_DEFAULT_DEG,
-            }, label="Return to base")
+            # Prefer a single hand that can reach both src and dst
+            if h1_src and h1_dst:
+                move_type = "direct"
+                move_hand = hand1
+            elif h2_src and h2_dst:
+                move_type = "direct"
+                move_hand = hand2
+            else:
+                move_type = "cross"
+                # The hand that can reach src picks; the other delivers to dst
+                if h1_src:
+                    src_hand, dst_hand = hand1, hand2
+                else:
+                    src_hand, dst_hand = hand2, hand1
+
+            # ── Handle capture (remove piece at dst first) ────────────────
+            if is_capture:
+                # Use the hand that will also do the final drop at dst
+                if move_type == "direct":
+                    cap_hand = move_hand
+                else:
+                    cap_hand = dst_hand
+
+                out_sq = cap_hand.cfg.out_position
+                if out_sq not in cap_hand.cfg.board_positions:
+                    print(f"  No 'out' position calibrated for {cap_hand.cfg.name}!")
+                    continue
+                if dst not in cap_hand.cfg.board_positions:
+                    print(f"  {cap_hand.cfg.name} has no position for '{dst}'!")
+                    continue
+
+                print(f"\n>>> CAPTURE: {cap_hand.cfg.name} removes piece from {dst}")
+                if not pick_and_place(cap_hand, dst, out_sq):
+                    continue
+                occupied.discard(dst)
+
+            # ── Execute the move ──────────────────────────────────────────
+            if move_type == "direct":
+                # Validate positions exist in the chosen hand's dict
+                if src not in move_hand.cfg.board_positions:
+                    print(f"  {move_hand.cfg.name} has no position for '{src}'")
+                    continue
+                if dst not in move_hand.cfg.board_positions:
+                    print(f"  {move_hand.cfg.name} has no position for '{dst}'")
+                    continue
+
+                print(f"\n>>> DIRECT MOVE: {move_hand.cfg.name}  {src} → {dst}")
+                if not pick_and_place(move_hand, src, dst,
+                                      adjust_pick=True, adjust_drop=True):
+                    continue
+
+            else:
+                # ── Cross-hand transfer via a common square ───────────────
+                transfer_sq = find_free_transfer_square(occupied, src_hand, dst_hand)
+                if transfer_sq is None:
+                    print("  No free transfer square available!")
+                    continue
+
+                # Validate all needed positions exist
+                for h, sq in [(src_hand, src), (src_hand, transfer_sq),
+                              (dst_hand, transfer_sq), (dst_hand, dst)]:
+                    if sq not in h.cfg.board_positions:
+                        print(f"  {h.cfg.name} has no position for '{sq}'")
+                        break
+                else:
+                    # No missing positions — proceed
+                    print(f"\n>>> CROSS-HAND TRANSFER via {transfer_sq}")
+                    print(f"    Step 1: {src_hand.cfg.name}  {src} → {transfer_sq}")
+                    print(f"    Step 2: {dst_hand.cfg.name}  {transfer_sq} → {dst}")
+
+                    if not pick_and_place(src_hand, src, transfer_sq,
+                                          adjust_pick=True):
+                        continue
+                    if not pick_and_place(dst_hand, transfer_sq, dst,
+                                          adjust_drop=True):
+                        continue
+
+            # ── Update board state ────────────────────────────────────────
+            occupied.discard(src)
+            occupied.add(dst)
+            print(f"\n  Board updated: {src} → {dst}")
 
     finally:
-        robot.disconnect()
-        print("Disconnected.")
+        hand1.disconnect()
+        hand2.disconnect()
+        print("Both hands disconnected.")
 
 
 if __name__ == "__main__":

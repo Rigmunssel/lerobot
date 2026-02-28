@@ -2,7 +2,7 @@ from stockfish import Stockfish
 
 # 1. Initialize Stockfish with the path to your downloaded executable
 # Replace this path with the actual path on your machine!
-stockfish_path = "path/to/your/stockfish_executable" 
+stockfish_path = "/home/rigmunssel/stockfish/stockfish-ubuntu-x86-64-avx2"
 
 try:
     # You can pass parameters upon initialization

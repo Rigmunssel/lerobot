@@ -8,9 +8,17 @@ BOARD_SIZE = 800       # We will stretch the board to be a perfect 800x800 squar
 SQUARE_SIZE = 100      # 800 / 8 = 100 pixels per square
 THRESHOLD = 30         # Sensitivity for pixel changes (0-255). Lower = more sensitive
 STABILITY_SECONDS = 1  # Seconds of no motion required before checking for a move
-MOTION_PIXELS = 800     # Frame-to-frame changed pixels that count as "motion" (hand/piece moving).
-                         # Raise if spurious triggers, lower if moves go undetected.
-COLOR_THRESHOLD = 5     # % change in red/blue presence to count as a piece arrival/departure.
+MOTION_PIXELS = 800    # Frame-to-frame changed pixels that count as "motion" (hand/piece moving).
+                        # Raise if spurious triggers, lower if moves go undetected.
+RED_THRESHOLD  = 3     # % change in red  presence to count as a piece arrival/departure.
+BLUE_THRESHOLD = 10     # % change in blue presence to count as a piece arrival/departure.
+
+# ── Game mode ─────────────────────────────────────────────────────────────────
+GAME_MODE = 2          # 1 = Human vs Human   (both sides detected from colour)
+                       # 2 = Human vs Robot   (human detected; robot move entered as text)
+HUMAN_COLOR = 'red'    # 'red' or 'blue' — which physical colour the human plays  (mode 2)
+RED_PLAYS_WHITE = False # True  → red pieces = White (uppercase), blue = Black (lowercase)
+                        # False → red = Black, blue = White  (default: black/red on top)
 
 # Chess grid mapping (Assuming you look at the board from White's perspective)
 COLS = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
@@ -131,31 +139,252 @@ def draw_color_presence_window(red_pct, blue_pct):
     return img
 
 
-def detect_move_from_color(baseline_r, baseline_b, curr_r, curr_b):
+def detect_move_from_color(baseline_r, baseline_b, curr_r, curr_b, only_color=None):
     """
     Compare current vs. baseline color presence grids.
 
-    For each colour (red, blue):
-      - Squares where presence dropped  > COLOR_THRESHOLD → piece departed  (from_sq)
-      - Squares where presence rose     > COLOR_THRESHOLD → piece arrived   (to_sq)
+    For each colour in {red, blue} (filtered by only_color if given):
+      - Squares where presence dropped  > threshold → piece departed  (from_sq)
+      - Squares where presence rose     > threshold → piece arrived   (to_sq)
 
     Returns a list of (color_name, from_sq, to_sq) for every colour that shows
-    exactly one departure and one arrival.  Returns [] if detection is ambiguous
-    or if no colour has moved.
+    exactly one departure and one arrival.  Returns [] if ambiguous or no move.
     """
-    moves = []
-    for color_name, baseline_pct, curr_pct in [
+    thresholds = {'red': RED_THRESHOLD, 'blue': BLUE_THRESHOLD}
+    candidates = [
         ("red",  baseline_r, curr_r),
         ("blue", baseline_b, curr_b),
-    ]:
+    ]
+    if only_color is not None:
+        candidates = [(n, b, c) for n, b, c in candidates if n == only_color]
+
+    moves = []
+    for color_name, baseline_pct, curr_pct in candidates:
+        thr   = thresholds[color_name]
         delta = curr_pct.astype(float) - baseline_pct.astype(float)
-        from_cells = [(r, c) for r in range(8) for c in range(8) if delta[r, c] < -COLOR_THRESHOLD]
-        to_cells   = [(r, c) for r in range(8) for c in range(8) if delta[r, c] >  COLOR_THRESHOLD]
+        from_cells = [(r, c) for r in range(8) for c in range(8) if delta[r, c] < -thr]
+        to_cells   = [(r, c) for r in range(8) for c in range(8) if delta[r, c] >  thr]
         if len(from_cells) == 1 and len(to_cells) == 1:
             from_sq = get_square_name(from_cells[0][1], from_cells[0][0])
             to_sq   = get_square_name(to_cells[0][1],   to_cells[0][0])
             moves.append((color_name, from_sq, to_sq))
+        elif len(from_cells) == 2 and len(to_cells) == 2:
+            # Castling moves both king and rook — check the 4 changed squares
+            changed = {get_square_name(c, r) for r, c in from_cells + to_cells}
+            for pat in CASTLING_PATTERNS:
+                if pat['squares'] == changed:
+                    # Return king move only; _apply_move_full handles the rook
+                    moves.append((color_name, pat['moves'][0][0], pat['moves'][0][1]))
+                    break
     return moves
+
+
+# ── Chess coordinate helpers ──────────────────────────────────────────────────
+
+def sq_to_cr(sq):
+    """'e4' → (col=4, row=6)  where col 0='a', row 0='8' (top of board)."""
+    return COLS.index(sq[0]), ROWS.index(sq[1])
+
+def cr_to_sq(col, row):
+    return COLS[col] + ROWS[row]
+
+# ── Legal-move engine ─────────────────────────────────────────────────────────
+
+def _pseudo_moves(sq, board, ep_sq, castling):
+    """
+    All squares a piece on sq could reach ignoring whether the move leaves
+    the king in check.  Handles castling and en-passant.
+    Returns list of to_sq strings.
+    """
+    piece = board.get(sq)
+    if piece is None:
+        return []
+    col, row = sq_to_cr(sq)
+    is_white  = piece.isupper()
+    pt        = piece.lower()
+    moves     = []
+
+    def try_sq(c, r, capture_ok=True):
+        """Add (c,r) if in range and not blocked by own piece; return True if clear."""
+        if not (0 <= c < 8 and 0 <= r < 8):
+            return False
+        tsq = cr_to_sq(c, r)
+        occ = board.get(tsq)
+        if occ is None:
+            moves.append(tsq); return True
+        if capture_ok and occ.isupper() != is_white:
+            moves.append(tsq)
+        return False
+
+    def slide(dc, dr):
+        c, r = col + dc, row + dr
+        while try_sq(c, r):
+            c += dc; r += dr
+        # If blocked by enemy, try_sq already added it and returned False — stop.
+
+    if pt == 'p':
+        d = -1 if is_white else 1          # direction: white moves toward row 0
+        sr = 6  if is_white else 1         # starting rank index
+        fwd = cr_to_sq(col, row + d)
+        if board.get(fwd) is None:         # one forward
+            moves.append(fwd)
+            if row == sr:                  # two forward from start
+                fwd2 = cr_to_sq(col, row + 2*d)
+                if board.get(fwd2) is None:
+                    moves.append(fwd2)
+        for dc in (-1, 1):                 # diagonal captures
+            nc, nr = col + dc, row + d
+            if 0 <= nc < 8 and 0 <= nr < 8:
+                csq = cr_to_sq(nc, nr)
+                occ = board.get(csq)
+                if (occ and occ.isupper() != is_white) or csq == ep_sq:
+                    moves.append(csq)
+
+    elif pt == 'n':
+        for dc, dr in ((-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)):
+            try_sq(col+dc, row+dr)
+
+    elif pt == 'b':
+        for dc, dr in ((-1,-1),(-1,1),(1,-1),(1,1)): slide(dc, dr)
+
+    elif pt == 'r':
+        for dc, dr in ((-1,0),(1,0),(0,-1),(0,1)): slide(dc, dr)
+
+    elif pt == 'q':
+        for dc, dr in ((-1,-1),(-1,1),(1,-1),(1,1),(-1,0),(1,0),(0,-1),(0,1)): slide(dc, dr)
+
+    elif pt == 'k':
+        for dc, dr in ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)):
+            try_sq(col+dc, row+dr)
+        # Castling
+        rights_k = 'K' if is_white else 'k'
+        rights_q = 'Q' if is_white else 'q'
+        base_row  = 7 if is_white else 0
+        if row == base_row and col == 4:
+            # Kingside
+            if castling.get(rights_k) and \
+               board.get(cr_to_sq(5, base_row)) is None and \
+               board.get(cr_to_sq(6, base_row)) is None:
+                moves.append(cr_to_sq(6, base_row))
+            # Queenside
+            if castling.get(rights_q) and \
+               board.get(cr_to_sq(3, base_row)) is None and \
+               board.get(cr_to_sq(2, base_row)) is None and \
+               board.get(cr_to_sq(1, base_row)) is None:
+                moves.append(cr_to_sq(2, base_row))
+
+    return moves
+
+
+def _is_attacked(sq, board, by_white):
+    """Return True if sq is attacked by any piece of the given colour."""
+    for from_sq in list(board.keys()):
+        p = board[from_sq]
+        if p.isupper() == by_white:
+            if sq in _pseudo_moves(from_sq, board, None, {}):
+                return True
+    return False
+
+
+def _find_king(board, is_white):
+    k = 'K' if is_white else 'k'
+    return next((sq for sq, p in board.items() if p == k), None)
+
+
+def _in_check(board, is_white):
+    ksq = _find_king(board, is_white)
+    return ksq is not None and _is_attacked(ksq, board, not is_white)
+
+
+def is_legal_move(from_sq, to_sq, board, turn, ep_sq, castling):
+    """
+    Full legal-move check including check-exposure.
+    Returns (True, '') or (False, reason_string).
+    """
+    piece = board.get(from_sq)
+    if piece is None:
+        return False, f"No piece on {from_sq}"
+    is_white = (turn == 'w')
+    if piece.isupper() != is_white:
+        return False, f"{from_sq} is not a {turn} piece"
+
+    pseudo = _pseudo_moves(from_sq, board, ep_sq, castling)
+    if to_sq not in pseudo:
+        return False, f"{piece.upper()} cannot move from {from_sq} to {to_sq}"
+
+    # Simulate and check king safety
+    test_board = dict(board)
+    _apply_move_full(from_sq, to_sq, test_board, ep_sq, castling.copy())
+    if _in_check(test_board, is_white):
+        return False, "That move leaves your king in check"
+
+    # Castling: king must not pass through or be in check
+    col, row = sq_to_cr(from_sq)
+    tc,  _   = sq_to_cr(to_sq)
+    if piece.lower() == 'k' and abs(tc - col) == 2:
+        mid_col = (col + tc) // 2
+        mid_sq  = cr_to_sq(mid_col, row)
+        if _is_attacked(from_sq, board, not is_white):
+            return False, "Cannot castle while in check"
+        if _is_attacked(mid_sq, board, not is_white):
+            return False, "Cannot castle through check"
+
+    return True, ''
+
+
+def _apply_move_full(from_sq, to_sq, board, ep_sq, castling):
+    """
+    Apply a move in-place and return the new en-passant square (or None).
+    Also updates castling dict.  Used both for the real game and simulations.
+    """
+    piece = board.pop(from_sq)
+    captured = board.get(to_sq)
+    is_white  = piece.isupper()
+
+    # En-passant capture
+    col_f, row_f = sq_to_cr(from_sq)
+    col_t, row_t = sq_to_cr(to_sq)
+    if piece.lower() == 'p' and to_sq == ep_sq:
+        ep_cap_row = row_t + (1 if is_white else -1)
+        board.pop(cr_to_sq(col_t, ep_cap_row), None)
+
+    board[to_sq] = piece
+
+    # Pawn promotion (auto-queen)
+    if piece == 'P' and row_t == 0: board[to_sq] = 'Q'
+    if piece == 'p' and row_t == 7: board[to_sq] = 'q'
+
+    # Castling rook move
+    if piece.lower() == 'k' and abs(col_t - col_f) == 2:
+        base_row = 7 if is_white else 0
+        if col_t == 6:  # kingside
+            board[cr_to_sq(5, base_row)] = board.pop(cr_to_sq(7, base_row))
+        else:           # queenside
+            board[cr_to_sq(3, base_row)] = board.pop(cr_to_sq(0, base_row))
+
+    # Update castling rights
+    revoke = {
+        'e1': ('K', 'Q'), 'e8': ('k', 'q'),
+        'h1': ('K',),     'a1': ('Q',),
+        'h8': ('k',),     'a8': ('q',),
+    }
+    for sq in (from_sq, to_sq):
+        for r in revoke.get(sq, ()):
+            castling[r] = False
+
+    # Compute new en-passant square
+    new_ep = None
+    if piece.lower() == 'p' and abs(row_t - row_f) == 2:
+        new_ep = cr_to_sq(col_f, (row_f + row_t) // 2)
+    return new_ep
+
+
+def color_to_turn(physical_color):
+    """Map 'red'/'blue' to 'w'/'b' respecting RED_PLAYS_WHITE."""
+    if RED_PLAYS_WHITE:
+        return 'w' if physical_color == 'red' else 'b'
+    else:
+        return 'b' if physical_color == 'red' else 'w'
 
 
 PIECE_NAMES = {
@@ -262,8 +491,13 @@ def main():
     print(f"Make your move and remove your hand. Move is registered after {STABILITY_SECONDS:.0f}s of no motion.")
     print("Press 'q' to quit.")
 
-    board_state = dict(state_standard)
-    turn = 'w'
+    board_state     = dict(state_standard)
+    turn            = 'w'
+    ep_square       = None                                  # en-passant target square
+    castling_rights = {'K': True, 'Q': True, 'k': True, 'q': True}
+
+    mode_str = "Human vs Human" if GAME_MODE == 1 else f"Human vs Robot  (human plays {HUMAN_COLOR})"
+    print(f"  Game mode: {mode_str}")
     print_board(board_state, turn)
 
     # baseline_gray / baseline_*_pct: last stable snapshot for move detection
@@ -272,7 +506,7 @@ def main():
     rolling_gray  = prev_gray.copy()
     baseline_red_pct, baseline_blue_pct = compute_color_presence(prev_warped)
     last_motion_time = time.time()
-    was_stable = True  # start as stable so the initial idle period doesn't trigger a false move
+    was_stable = True
 
     while True:
         ret, frame = cap.read()
@@ -301,92 +535,111 @@ def main():
         curr_red_pct, curr_blue_pct = compute_color_presence(live_warped)
 
         if is_stable and not was_stable:
-            # Board just settled after disturbance — check for a chess move
             was_stable = True
-            print("\n🔍 Board stable — analyzing move...")
+            print("\nBoard stable — analyzing...")
 
-            # ── Primary: colour-presence diff ────────────────────────────────
-            color_moves = detect_move_from_color(
-                baseline_red_pct, baseline_blue_pct,
-                curr_red_pct,     curr_blue_pct,
-            )
+            human_turn_color = color_to_turn(HUMAN_COLOR)
+            is_human_turn    = (GAME_MODE == 1) or (turn == human_turn_color)
 
-            move_detected = False
-            if color_moves:
-                for color_name, from_sq, to_sq in color_moves:
-                    piece    = board_state.get(from_sq)
-                    captured = board_state.get(to_sq)
-                    if piece:
-                        apply_move(from_sq, to_sq, board_state)
-                        if piece in ('P', 'p') and from_sq[0] != to_sq[0] and not captured:
-                            ep_sq = to_sq[0] + from_sq[1]
-                            if board_state.pop(ep_sq, None):
-                                print(f"  (En passant — captured piece removed from {ep_sq})")
+            if is_human_turn:
+                # Detect color-presence delta for the relevant side
+                only_color = HUMAN_COLOR if GAME_MODE == 2 else None
+                color_moves = detect_move_from_color(
+                    baseline_red_pct, baseline_blue_pct,
+                    curr_red_pct,     curr_blue_pct,
+                    only_color=only_color,
+                )
+
+                # Mode 1: if both colors changed, keep only the one matching current turn
+                if GAME_MODE == 1 and len(color_moves) > 1:
+                    turn_phys = 'red' if (turn == 'w') == RED_PLAYS_WHITE else 'blue'
+                    filtered  = [m for m in color_moves if m[0] == turn_phys]
+                    if filtered:
+                        color_moves = filtered
+
+                if not color_moves:
+                    print("  No color change detected — board may not have changed.")
+                else:
+                    color_name, from_sq, to_sq = color_moves[0]
+                    if len(color_moves) > 1:
+                        print(f"  Multiple candidates detected — using {from_sq} -> {to_sq}")
+
+                    legal, reason = is_legal_move(
+                        from_sq, to_sq, board_state, turn, ep_square, castling_rights
+                    )
+                    if not legal:
+                        print(f"  ILLEGAL MOVE: {from_sq} -> {to_sq}  ({reason})")
+                        print("  Please move the piece back and try again.")
+                        # Do NOT update baselines — piece moves back, re-triggers stability
+                    else:
+                        piece       = board_state.get(from_sq)
+                        captured    = board_state.get(to_sq)
+                        ep_square   = _apply_move_full(
+                            from_sq, to_sq, board_state, ep_square, castling_rights
+                        )
                         capture_str = f" x {PIECE_NAMES[captured]}" if captured else ""
-                        print(f"🎨 {color_name.capitalize()} piece: {from_sq} → {to_sq}"
+                        print(f"  {color_name.capitalize()}: {from_sq} -> {to_sq}"
                               f"{capture_str}  [{PIECE_NAMES.get(piece, piece)}]")
                         turn = 'b' if turn == 'w' else 'w'
-                        move_detected = True
-                if move_detected:
+                        print_board(board_state, turn)
+                        baseline_red_pct  = curr_red_pct.copy()
+                        baseline_blue_pct = curr_blue_pct.copy()
+
+            else:
+                # Robot's turn (Mode 2 only) — get move via text input
+                side = 'White' if turn == 'w' else 'Black'
+                print(f"  Robot's turn ({side}). Enter move (e.g. 'e2 e4' or 'O-O'): ",
+                      end='', flush=True)
+                while True:
+                    raw = input().strip()
+                    if not raw:
+                        continue
+                    parts = raw.lower().split()
+                    if len(parts) == 2:
+                        r_from, r_to = parts[0], parts[1]
+                    elif raw.upper() in ('O-O', 'O-O-O'):
+                        r_from = 'e1' if turn == 'w' else 'e8'
+                        r_to   = ('g1' if turn == 'w' else 'g8') \
+                                 if raw.upper() == 'O-O' \
+                                 else ('c1' if turn == 'w' else 'c8')
+                    else:
+                        print("  Invalid format. Use 'e2 e4' or 'O-O'/'O-O-O': ",
+                              end='', flush=True)
+                        continue
+
+                    legal, reason = is_legal_move(
+                        r_from, r_to, board_state, turn, ep_square, castling_rights
+                    )
+                    if not legal:
+                        print(f"  Illegal ({reason}). Try again: ", end='', flush=True)
+                        continue
+
+                    piece    = board_state.get(r_from)
+                    captured = board_state.get(r_to)
+                    ep_square = _apply_move_full(
+                        r_from, r_to, board_state, ep_square, castling_rights
+                    )
+                    capture_str = f" x {PIECE_NAMES[captured]}" if captured else ""
+                    print(f"  Robot: {r_from} -> {r_to}{capture_str}"
+                          f"  [{PIECE_NAMES.get(piece, piece)}]")
+                    turn = 'b' if turn == 'w' else 'w'
                     print_board(board_state, turn)
 
-            # ── Fallback: grayscale diff (non-coloured pieces / ambiguous colour) ─
-            if not move_detected:
-                diff = cv2.absdiff(baseline_gray, curr_gray)
-                _, thresh = cv2.threshold(diff, THRESHOLD, 255, cv2.THRESH_BINARY)
-                cv2.imshow("Difference Math", thresh)
-
-                square_changes = []
-                for row in range(8):
-                    for col in range(8):
-                        y_start, x_start = row * SQUARE_SIZE, col * SQUARE_SIZE
-                        square_crop = thresh[y_start:y_start + SQUARE_SIZE, x_start:x_start + SQUARE_SIZE]
-                        change_amount = cv2.countNonZero(square_crop)
-                        if change_amount > 100:
-                            square_changes.append({"name": get_square_name(col, row), "amount": change_amount})
-
-                square_changes.sort(key=lambda x: x["amount"], reverse=True)
-
-                if len(square_changes) >= 2:
-                    sq1 = square_changes[0]['name']
-                    sq2 = square_changes[1]['name']
-                    changed_set = {s['name'] for s in square_changes[:4]}
-
-                    castled = False
-                    for pat in CASTLING_PATTERNS:
-                        if pat['squares'].issubset(changed_set) and board_state.get(pat['king_sq']) in ('K', 'k'):
-                            for from_sq, to_sq in pat['moves']:
-                                apply_move(from_sq, to_sq, board_state)
-                            turn = 'b' if turn == 'w' else 'w'
-                            print(f"Move: {pat['name']}")
-                            castled = True
-                            break
-
-                    if not castled:
-                        move = infer_move(sq1, sq2, board_state, turn)
-                        if move:
-                            from_sq, to_sq = move
-                            piece = board_state[from_sq]
-                            captured = board_state.get(to_sq)
-                            apply_move(from_sq, to_sq, board_state)
-                            if piece in ('P', 'p') and from_sq[0] != to_sq[0] and not captured:
-                                ep_sq = to_sq[0] + from_sq[1]
-                                if board_state.pop(ep_sq, None):
-                                    print(f"  (En passant — captured piece removed from {ep_sq})")
-                            capture_str = f" x {PIECE_NAMES[captured]}" if captured else ""
-                            print(f"Move: {from_sq} -> {to_sq}{capture_str}  [{PIECE_NAMES[piece]}]")
-                            turn = 'b' if turn == 'w' else 'w'
+                    # The baseline for the next human-move comparison stays as-is —
+                    # robot piece positions are not tracked in the human color grid.
+                    # Only exception: if the robot captured a human piece, zero out
+                    # that square so the delta correctly shows nothing left there.
+                    if captured:
+                        cap_col, cap_row = sq_to_cr(r_to)
+                        if HUMAN_COLOR == 'red':
+                            baseline_red_pct[cap_row, cap_col] = 0.0
                         else:
-                            print(f"Squares changed: {sq1} and {sq2} — could not infer direction (wrong turn?)")
+                            baseline_blue_pct[cap_row, cap_col] = 0.0
 
-                    print_board(board_state, turn)
-                else:
-                    print("⚠️ Not enough change detected vs. last stable snapshot.")
-
-            # Update both baselines together
-            baseline_gray     = curr_gray.copy()
-            baseline_red_pct  = curr_red_pct.copy()
-            baseline_blue_pct = curr_blue_pct.copy()
+                    # Reset rolling_gray so the stale pre-input() frame doesn't
+                    # cause a false motion spike on the first post-input() frame.
+                    rolling_gray = curr_gray.copy()
+                    break
 
         # ── Color presence window (continuous) ───────────────────────────────
         cv2.imshow("Color Presence", draw_color_presence_window(curr_red_pct, curr_blue_pct))
