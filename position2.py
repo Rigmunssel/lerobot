@@ -6,7 +6,7 @@ from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 from lerobot.model.kinematics import RobotKinematics
 
 # Setup (Use your actual paths/ports)
-PORT = "/dev/ttyACM0"
+PORT = "/dev/ttyACM1"
 ROBOT_ID = "follower1"
 
 # ALWAYS use absolute paths with placo!
@@ -21,7 +21,7 @@ def main():
     kin = RobotKinematics(
         urdf_path=URDF_PATH,
         target_frame_name="gripper_frame_link",
-        joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+        joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
     )
     
     # 2. Connect to the robot
@@ -43,11 +43,11 @@ def main():
             obs = robot.get_observation()
             
             # Grab the 5 arm joints
-            kin_joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+            kin_joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
             current_angles = np.array([obs[f"{n}.pos"] for n in kin_joint_names], dtype=float)
             
             # Print on a single continuously updating line
-            print(f"\rPan: {current_angles[0]:+7.1f}° | Lift: {current_angles[1]:+7.1f}° | Elbow: {current_angles[2]:+7.1f}° | Wrist Flex: {current_angles[3]:+7.1f}° | Wrist Roll: {current_angles[4]:+7.1f}°", end="")
+            print(f"\rPan: {current_angles[0]:+7.1f}° | Lift: {current_angles[1]:+7.1f}° | Elbow: {current_angles[2]:+7.1f}° | Wrist Flex: {current_angles[3]:+7.1f}° | Wrist Roll: {current_angles[4]:+7.1f}°,| Gripper: {current_angles[5]:+7.1f}°,  ", end="")
             time.sleep(0.05)  # 20Hz update
             
     except KeyboardInterrupt:
