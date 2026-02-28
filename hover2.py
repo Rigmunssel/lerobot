@@ -1,9 +1,10 @@
 import math
+import time
 from pathlib import Path
 from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-PORT     = "/dev/ttyACM2"
+PORT     = "/dev/ttyACM4"
 ROBOT_ID = "follower1"
 
 # Hardware geometry (metres)
@@ -22,19 +23,27 @@ PAN_OFFSET = -4.1
 
 # ── Movement parameters ───────────────────────────────────────────────────────
 STEP_DEG               =  2.0  # step size (°) for shoulder / elbow / wrist moves
-PAN_STEP_DEG           =  5.0  # step size (°) for pan rotation (faster, less precision needed)
+STEP_DEG_DOWN          =  1.0  # step size (°) when lowering arm
+STEP_DEG_UP            =  1.0  # step size (°) when raising arm
+MIN_STEP_DEG           =  0.5  # minimum step (°) — prevents getting stuck on sub-resolution moves
+STEP_WAIT_SEC          =  0.01  # pause between steps for general movements (pan, shoulder, approach)
+STEP_WAIT_DOWN_SEC     =  0.05  # pause between steps when lowering arm
+STEP_WAIT_UP_SEC       =  0.05  # pause between steps when raising arm
+STEP_DEG_GRIPPER       =  1.0   # step size (°) for gripper open/close
+STEP_WAIT_GRIPPER_SEC  =  0.05  # pause between steps for gripper
+PAN_STEP_DEG           =  10.0  # step size (°) for pan rotation (faster, less precision needed)
 FOREARM_ANGLE_DEG      =  -15  # shoulder_lift + elbow_flex sum kept constant during sweep
-TOLERANCE_PAN          =  1.0  # pan "close enough" threshold (°)
+TOLERANCE_PAN          =  0.55  # pan "close enough" threshold (°)
 TOLERANCE_DEG          =  0.1  # "at target" threshold for vertical moves (°)
-APPROACH_TOLERANCE_DEG =  1.0  # good-enough tolerance for approach / grasp poses
+APPROACH_TOLERANCE_DEG =  0.55  # good-enough tolerance for approach / grasp poses
 GRIPPER_TOLERANCE_DEG  =  1.0  # tight tolerance for gripper open/close
 
 # ── Gripper ───────────────────────────────────────────────────────────────────
-GRIPPER_DEFAULT_DEG = 15.3   # open / resting
+GRIPPER_DEFAULT_DEG = 17.3   # open / resting
 GRIPPER_CLOSED_DEG  =  3.5   # closed / grasping
 
 # ── Pick / place depth ────────────────────────────────────────────────────────
-TARGET_Z_DOWN = 0.07         # Z height (metres) to lower to for pick / place
+TARGET_Z_DOWN = 0.065         # Z height (metres) to lower to for pick / place
 
 # ── Fixed approach pose (pan is computed per-target) ─────────────────────────
 APPROACH_LIFT_DEG       = -38.0
@@ -46,14 +55,86 @@ APPROACH_WRIST_ROLL_DEG =  -1.0
 GRASP_PAN_DEG        =  -4.1
 GRASP_LIFT_DEG       = -105.5
 GRASP_ELBOW_DEG      =   96.9
-GRASP_WRIST_FLEX_DEG = -100.1
+GRASP_WRIST_FLEX_DEG = -102
 GRASP_WRIST_ROLL_DEG =   -1.0
 
 # ── Board position map ────────────────────────────────────────────────────────
 # Run get_positions.py to generate this dict and paste the output here.
 # Keys are lowercase square names ("a1"…"h8"), values are (x, y, z) in metres.
-BOARD_POSITIONS = {}
+BOARD_POSITIONS = {
+    "a8": (0.1183, 0.0514, 0.2),
+    "b8": (0.1301, 0.0514, 0.2),
+    "c8": (0.182, 0.069, 0.2),
+    "d8": (0.2138, 0.0778, 0.2),
+    "e8": (0.2457, 0.0866, 0.2),
+    "f8": (0.2775, 0.0954, 0.2),
+    "g8": (0.3094, 0.1042, 0.2),
+    "h8": (0.3413, 0.113, 0.2),
 
+    "a7": (0.1239, 0.0316, 0.2),
+    "b7": (0.155, 0.039, 0.2),
+    "c7": (0.1861, 0.0464, 0.2),
+    "d7": (0.2172, 0.0538, 0.2),
+    "e7": (0.2483, 0.0612, 0.2),
+    "f7": (0.2793, 0.0686, 0.2),
+    "g7": (0.3104, 0.076, 0.2),
+    "h7": (0.3415, 0.0834, 0.2),
+
+    "a6": (0.1295, 0.0118, 0.2),
+    "b6": (0.1599, 0.0178, 0.2),
+    "c6": (0.1902, 0.0238, 0.2),
+    "d6": (0.2205, 0.0298, 0.2),
+    "e6": (0.2508, 0.0358, 0.2),
+    "f6": (0.2811, 0.0418, 0.2),
+    "g6": (0.3115, 0.0478, 0.2),
+    "h6": (0.3418, 0.0537, 0.2),
+
+    "a5": (0.1352, -0.008, 0.2),
+    "b5": (0.1647, -0.0034, 0.2),
+    "c5": (0.1943, 0.0012, 0.2),
+    "d5": (0.2238, 0.0058, 0.2),
+    "e5": (0.2534, 0.0104, 0.2),
+    "f5": (0.2829, 0.0149, 0.2),
+    "g5": (0.3125, 0.0195, 0.2),
+    "h5": (0.342, 0.0241, 0.2),
+
+    "a4": (0.1408, -0.0278, 0.2),
+    "b4": (0.1696, -0.0246, 0.2),
+    "c4": (0.1984, -0.0214, 0.2),
+    "d4": (0.2272, -0.0182, 0.2),
+    "e4": (0.256, -0.0151, 0.2),
+    "f4": (0.2847, -0.0119, 0.2),
+    "g4": (0.3135, -0.0087, 0.2),
+    "h4": (0.3423, -0.0055, 0.2),
+
+    "a3": (0.1465, -0.0476, 0.2),
+    "b3": (0.1745, -0.0458, 0.2),
+    "c3": (0.2025, -0.044, 0.2),
+    "d3": (0.2305, -0.0423, 0.2),
+    "e3": (0.2585, -0.0405, 0.2),
+    "f3": (0.2865, -0.0387, 0.2),
+    "g3": (0.3146, -0.0369, 0.2),
+    "h3": (0.3426, -0.0351, 0.2),
+
+    "a2": (0.142, -0.048, 0.2),
+    "b2": (0.1794, -0.067, 0.2),
+    "c2": (0.2066, -0.0666, 0.2),
+    "d2": (0.2338, -0.0663, 0.2),
+    "e2": (0.2611, -0.0659, 0.2),
+    "f2": (0.2883, -0.0655, 0.2),
+    "g2": (0.3156, -0.0651, 0.2),
+    "h2": (0.3428, -0.0647, 0.2),
+
+    "a1": (0.114, -0.04, 0.2),
+    "b1": (0.144, -0.04, 0.2),
+    "c1": (0.210, -0.088, 0.2),
+    "d1": (0.198, -0.12, 0.2),
+    "e1": (0.231, -0.078, 0.2),
+    "f1": (0.254, -0.088, 0.2),
+    "g1": (0.282, -0.098, 0.2),
+    "h1": (0.310, -0.108, 0.2),
+
+}
 
 # ── Forward kinematics ────────────────────────────────────────────────────────
 
@@ -153,12 +234,12 @@ def _print_step_table(joints, extra=None):
 
 # ── Step-to-pose (any set of joints) ──────────────────────────────────────────
 
-def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG):
+def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
+                 step_deg=STEP_DEG, wait_sec=STEP_WAIT_SEC):
     """
-    Move joints in `targets` {name: deg} step-by-step, Enter-confirmed.
-    Lead joint (largest Δ) takes STEP_DEG; others scale proportionally.
+    Move joints in `targets` {name: deg} step-by-step with timed pauses.
+    Lead joint (largest Δ) takes step_deg; others scale proportionally.
     Only the joints listed in targets are moved; all others hold via _cmd.
-    Returns False on cancel.
     """
     _init_cmd(robot)
     obs       = robot.get_observation()
@@ -172,8 +253,13 @@ def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG):
         if max_rem <= tol:
             print("  All joints at target.")
             return True
-        scale  = min(1.0, STEP_DEG / max_rem)
-        steps  = {n: remaining[n] * scale for n in targets}
+        scale  = min(1.0, step_deg / max_rem)
+        steps  = {}
+        for n in targets:
+            s     = remaining[n] * scale
+            abs_s = max(MIN_STEP_DEG, abs(s))          # enforce minimum
+            abs_s = min(abs_s, abs(remaining[n]))      # but never overshoot
+            steps[n] = math.copysign(abs_s, remaining[n])
         obs    = robot.get_observation()
         actual = {n: float(obs[f"{n}.pos"]) for n in targets}
         _print_step_table([
@@ -181,9 +267,7 @@ def step_to_pose(robot, targets, label="Move", tol=APPROACH_TOLERANCE_DEG):
                  target=targets[n], step=steps[n])
             for n in targets
         ])
-        if input("  Press Enter to take this step (or 'q' to cancel): ").strip().lower() == 'q':
-            print("  Cancelled.")
-            return False
+        time.sleep(wait_sec)
         new_vals  = {n: commanded[n] + steps[n] for n in targets}
         send_joints(robot, **new_vals)
         commanded = new_vals
@@ -213,7 +297,10 @@ def go_vertical(robot, pan_deg, sh_deg, target_el, label="Vertical"):
             cz  = get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
             print(f"  Done.  Z = {cz:.3f} m")
             return history
-        step_el  = math.copysign(min(STEP_DEG, abs(remaining_el)), remaining_el)
+        abs_step = min(STEP_DEG_DOWN, abs(remaining_el))
+        abs_step = max(MIN_STEP_DEG, abs_step)         # enforce minimum
+        abs_step = min(abs_step, abs(remaining_el))    # but never overshoot
+        step_el  = math.copysign(abs_step, remaining_el)
         new_el   = commanded_el + step_el
         new_wf   = commanded_wf - step_el
         obs      = robot.get_observation()
@@ -227,8 +314,7 @@ def go_vertical(robot, pan_deg, sh_deg, target_el, label="Vertical"):
             dict(name="wrist_flex", actual=act_wf, commanded=commanded_wf,
                  target=target_wf, step=-step_el),
         ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m  (target {TARGET_Z_DOWN:+.3f} m)")
-        if input("  Press Enter to take this step (or 'q' to cancel): ").strip().lower() == 'q':
-            return history
+        time.sleep(STEP_WAIT_DOWN_SEC)
         send_joints(robot, elbow_flex=new_el, wrist_flex=new_wf)
         commanded_el = new_el
         commanded_wf = new_wf
@@ -237,37 +323,45 @@ def go_vertical(robot, pan_deg, sh_deg, target_el, label="Vertical"):
 
 def go_vertical_reverse(robot, pan_deg, sh_deg, history, label="Vertical (reversed)"):
     """
-    Retrace a go_vertical path in reverse: replay each saved (el, wf)
-    position in reverse order.  Exact mirror of the descent — no re-solving.
+    Raise arm back to the position recorded before descent (history[0]).
+    Steps by STEP_DEG_UP; wrist_flex tracks elbow linearly (same coupling as descent).
     Only elbow_flex and wrist_flex move; all other joints hold via _cmd.
     """
-    # history[0] = position before descent, history[-1] = bottom position
-    # Reverse: play history[-2], ..., history[0]
-    targets = list(reversed(history[:-1]))
-    if not targets:
+    if len(history) < 2:
         return
+    start_el, start_wf = history[0]   # target = position before descent
     _init_cmd(robot)
+    commanded_el = _cmd.get("elbow_flex", start_el)
+    commanded_wf = _cmd.get("wrist_flex", start_wf)
     print(f"\n--- {label} ---")
-    for (target_el, target_wf) in targets:
-        obs     = robot.get_observation()
-        act_el  = float(obs["elbow_flex.pos"])
-        act_wf  = float(obs["wrist_flex.pos"])
-        cmd_el  = _cmd.get("elbow_flex", act_el)
-        cmd_wf  = _cmd.get("wrist_flex", act_wf)
-        curr_z  = get_xyz(pan_deg, sh_deg, act_el)[2]
-        after_z = get_xyz(pan_deg, sh_deg, target_el)[2]
-        _print_step_table([
-            dict(name="elbow_flex", actual=act_el, commanded=cmd_el,
-                 target=target_el, step=target_el - cmd_el),
-            dict(name="wrist_flex", actual=act_wf, commanded=cmd_wf,
-                 target=target_wf, step=target_wf - cmd_wf),
-        ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m")
-        if input("  Press Enter to take this step (or 'q' to cancel): ").strip().lower() == 'q':
+    while True:
+        remaining_el = start_el - commanded_el
+        if abs(remaining_el) < TOLERANCE_DEG:
+            obs = robot.get_observation()
+            cz  = get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
+            print(f"  Done.  Z = {cz:.3f} m")
             return
-        send_joints(robot, elbow_flex=target_el, wrist_flex=target_wf)
-    obs = robot.get_observation()
-    cz  = get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
-    print(f"  Done.  Z = {cz:.3f} m")
+        abs_step = min(STEP_DEG_UP, abs(remaining_el))
+        abs_step = max(MIN_STEP_DEG, abs_step)
+        abs_step = min(abs_step, abs(remaining_el))
+        step_el  = math.copysign(abs_step, remaining_el)
+        new_el   = commanded_el + step_el
+        new_wf   = start_wf - (new_el - start_el)
+        obs      = robot.get_observation()
+        act_el   = float(obs["elbow_flex.pos"])
+        act_wf   = float(obs["wrist_flex.pos"])
+        curr_z   = get_xyz(pan_deg, sh_deg, act_el)[2]
+        after_z  = get_xyz(pan_deg, sh_deg, new_el)[2]
+        _print_step_table([
+            dict(name="elbow_flex", actual=act_el, commanded=commanded_el,
+                 target=start_el, step=step_el),
+            dict(name="wrist_flex", actual=act_wf, commanded=commanded_wf,
+                 target=start_wf, step=-step_el),
+        ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m")
+        time.sleep(STEP_WAIT_UP_SEC)
+        send_joints(robot, elbow_flex=new_el, wrist_flex=new_wf)
+        commanded_el = new_el
+        commanded_wf = new_wf
 
 
 # ── Phases 1-3 helper ─────────────────────────────────────────────────────────
@@ -311,8 +405,7 @@ def move_to_xyz(robot, tx, ty, tz, prefix="", skip_approach=False):
                  commanded=_cmd.get("shoulder_pan", curr_pan),
                  target=pan_deg, step=step_pan),
         ])
-        if input("  Press Enter to take this step (or 'q' to cancel): ").strip().lower() == 'q':
-            return None
+        time.sleep(STEP_WAIT_SEC)
         send_joints(robot, shoulder_pan=curr_pan + step_pan)
 
     # ── Phase 2: approach pose (skipped when already in approach config) ──────
@@ -343,7 +436,10 @@ def move_to_xyz(robot, tx, ty, tz, prefix="", skip_approach=False):
             err_mm = math.sqrt((cx-tx)**2+(cy-ty)**2+(cz-tz)**2)*1000.0
             print(f"\n  At target.  [FINAL POS]  X:{cx:+.3f}  Y:{cy:+.3f}  Z:{cz:+.3f}  (err {err_mm:.1f} mm)")
             break
-        step_sh  = math.copysign(min(STEP_DEG, abs(remaining)), remaining)
+        abs_step = min(STEP_DEG, abs(remaining))
+        abs_step = max(MIN_STEP_DEG, abs_step)
+        abs_step = min(abs_step, abs(remaining))
+        step_sh  = math.copysign(abs_step, remaining)
         new_sh   = commanded_sh + step_sh
         new_el   = FOREARM_ANGLE_DEG - new_sh
         step_el  = new_el - commanded_el
@@ -361,8 +457,7 @@ def move_to_xyz(robot, tx, ty, tz, prefix="", skip_approach=False):
                  target=elbow_target,   step=step_el),
         ], extra=f"sum after step: {new_sh:.2f}° + {new_el:.2f}° = {new_sh+new_el:.2f}°"
                  f"  (target {FOREARM_ANGLE_DEG}°)")
-        if input("  Press Enter to take this step (or 'q' to cancel): ").strip().lower() == 'q':
-            return None
+        time.sleep(STEP_WAIT_SEC)
         send_joints(robot, shoulder_lift=new_sh, elbow_flex=new_el)
         commanded_sh = new_sh
         commanded_el = new_el
@@ -438,7 +533,8 @@ def main():
 
             # ── Close gripper ─────────────────────────────────────────────────
             step_to_pose(robot, {"gripper": GRIPPER_CLOSED_DEG},
-                         label="Close gripper", tol=GRIPPER_TOLERANCE_DEG)
+                         label="Close gripper", tol=GRIPPER_TOLERANCE_DEG,
+                         step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
 
             # ── Go back up — exact reverse of the descent ─────────────────────
             go_vertical_reverse(robot, pan1, sh1, down_history1, label="Go up (pick)")
@@ -466,7 +562,8 @@ def main():
 
             # ── Open gripper ──────────────────────────────────────────────────
             step_to_pose(robot, {"gripper": GRIPPER_DEFAULT_DEG},
-                         label="Open gripper", tol=GRIPPER_TOLERANCE_DEG)
+                         label="Open gripper", tol=GRIPPER_TOLERANCE_DEG,
+                         step_deg=STEP_DEG_GRIPPER, wait_sec=STEP_WAIT_GRIPPER_SEC)
 
             # ── Go back up — exact reverse of the descent ─────────────────────
             go_vertical_reverse(robot, pan2, sh2, down_history2, label="Go up (drop)")
