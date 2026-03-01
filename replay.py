@@ -1,91 +1,117 @@
 import time
 import json
+import sys
 from pathlib import Path
 from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 
-# ── Configuration ────────────────────────────────────────────────────────────
-PORT = "/dev/ttyACM"
-ROBOT_ID = "follower1"
+# ── Configuration (same as record1.py) ───────────────────────────────────────
+FOLLOWER_PORT = "/dev/ttyACM0"
+FOLLOWER_ID = "follower2"
 CALIBRATION_DIR = Path(".")
+FPS = 30
 
-# Your specific "Home" angles (Matches the recording script)
-HOME_POS = {
-    "shoulder_pan.pos": -4.7,
-    "shoulder_lift.pos": -106.5,
-    "elbow_flex.pos": 96.5,
-    "wrist_flex.pos": -100.9,
-    "wrist_roll.pos": 4.7,
-    "gripper.pos": 50.0
-}
+# ── Recordings to play back-to-back ─────────────────────────────────────────
+RECORDINGS = [
+    Path("Be7.json"),
+    Path("Nxe5T.json"),
+   
+]
+SPEED = 2.0  # playback speed multiplier (2.0 = twice as fast)
+HOME_FILE = Path("home.json")  # arm returns here at the end
 
-def move_smoothly(robot, target_angles, duration_sec=3.0, steps=60):
-    """Safely glides the arm to a specific posture."""
-    obs = robot.get_observation()
-    start_angles = {k: obs[k] for k in target_angles.keys()}
-    current_action = {k: v for k, v in obs.items() if k.endswith(".pos")}
-    
-    pause_time = duration_sec / steps
-    for step in range(1, steps + 1):
-        progress = step / steps
-        for joint, final_angle in target_angles.items():
-            current_action[joint] = start_angles[joint] + ((final_angle - start_angles[joint]) * progress)
-        robot.send_action(current_action)
-        time.sleep(pause_time)
 
-def play_file(robot, filename):
-    # 1. Load Recording
-    try:
-        with open(filename, 'r') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ Error: File {filename} not found.")
+def make_follower():
+    cfg = SOFollowerRobotConfig(
+        port=FOLLOWER_PORT,
+        id=FOLLOWER_ID,
+        calibration_dir=CALIBRATION_DIR,
+    )
+    return SOFollower(cfg)
+
+
+def go_to_position(follower, target, steps=60, duration=1.5):
+    """Smoothly move the follower to *target* over *duration* seconds."""
+    obs = follower.get_observation()
+    start = {k: float(v) for k, v in obs.items() if k.endswith(".pos")}
+    dt = duration / steps
+    for i in range(1, steps + 1):
+        alpha = i / steps
+        interp = {k: start[k] + alpha * (target[k] - start[k]) for k in target}
+        follower.send_action(interp)
+        time.sleep(dt)
+
+
+def replay_file(follower, path: Path):
+    """Play one recording file on the already-connected follower."""
+    if not path.exists():
+        print(f"  ❌  File not found: {path}")
         return
 
-    print(f"Loaded {len(data)} frames from {filename}.")
+    frames = json.loads(path.read_text())
+    if not frames:
+        print(f"  ⚠️   {path} is empty, skipping")
+        return
 
-    # 2. Sync to Home/Start Position
-    print("\n[Step 1/3] Moving to HOME/START position...")
-    move_smoothly(robot, HOME_POS, duration_sec=3.0)
-    
-    # 3. Playback
-    input("\n[Step 2/3] Ready. Press ENTER to play the recording... ")
-    print(" >> PLAYING... <<")
-    
-    for i in range(len(data)):
-        frame = data[i]
-        robot.send_action(frame["positions"])
-        
-        # Calculate timing based on recorded timestamps
-        if i < len(data) - 1:
-            wait = data[i+1]["timestamp"] - frame["timestamp"]
-            # Cap wait time to 0.1s to prevent huge jumps if script lagged
-            time.sleep(max(0, min(0.1, wait)))
+    dt = 1.0 / FPS
 
-    print(" >> PLAYBACK FINISHED <<")
+    # smoothly move to the first frame before replaying
+    first_action = {k: v for k, v in frames[0].items() if not k.startswith("_")}
+    print(f"  ↳ moving to start position...")
+    go_to_position(follower, first_action)
 
-    # 4. Return to Home
-    print("\n[Step 3/3] Returning to HOME position for safety...")
-    move_smoothly(robot, HOME_POS, duration_sec=2.0)
-    print("Done.")
+    print(f"  ▶️   Playing {len(frames)} frames...")
+    for i, frame in enumerate(frames):
+        t0 = time.perf_counter()
+
+        action = {k: v for k, v in frame.items() if not k.startswith("_")}
+        follower.send_action(action)
+
+        # use recorded timestamps for timing when available
+        if i + 1 < len(frames) and "_t" in frame and "_t" in frames[i + 1]:
+            wait = (frames[i + 1]["_t"] - frame["_t"]) / SPEED
+        else:
+            wait = dt / SPEED
+
+        elapsed = time.perf_counter() - t0
+        if elapsed < wait:
+            time.sleep(wait - elapsed)
+
 
 def main():
-    config = SOFollowerRobotConfig(
-        port=PORT, id=ROBOT_ID, calibration_dir=CALIBRATION_DIR, use_degrees=True
-    )
-    robot = SOFollower(config)
-    robot.connect()
+    # allow overriding files from CLI:  python replay.py file1.json file2.json ...
+    recordings = [Path(p) for p in sys.argv[1:]] if len(sys.argv) > 1 else RECORDINGS
+
+    follower = make_follower()
+    follower.connect()
+
+    print(f"\n▶️   Replaying {len(recordings)} recording(s) back-to-back")
+    print(f"   (Ctrl+C to stop early)\n")
 
     try:
-        while True:
-            file_to_play = input("\nEnter the filename to replay (e.g. 'move1.json') or 'q' to quit: ").strip()
-            if file_to_play.lower() == 'q':
-                break
-            
-            play_file(robot, file_to_play)
-            
-    finally:
-        print("\nShutting down. PLEASE HOLD THE ARM!")
-        robot.disconnect()
+        for idx, rec in enumerate(recordings, 1):
+            print(f"[{idx}/{len(recordings)}] {rec}")
+            replay_file(follower, rec)
+            print()
+    except KeyboardInterrupt:
+        print("\n⏹  Stopped early")
+
+    # slowly return to the home position (last frame of home.json)
+    if HOME_FILE.exists():
+        home_frames = json.loads(HOME_FILE.read_text())
+        if home_frames:
+            home_pos = {k: v for k, v in home_frames[-1].items() if not k.startswith("_")}
+            print("🏠  Returning to home position...")
+            go_to_position(follower, home_pos, steps=90, duration=2.5)
+    else:
+        print(f"⚠️   {HOME_FILE} not found, skipping home position")
+
+    try:
+        follower.disconnect()
+    except RuntimeError as e:
+        print(f"⚠️   Could not cleanly disconnect follower: {e}")
+
+    print("✅  Done")
+
 
 if __name__ == "__main__":
     main()
