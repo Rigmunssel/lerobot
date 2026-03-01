@@ -5,53 +5,78 @@ from pathlib import Path
 from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 
 # ── Configuration (same as record1.py) ───────────────────────────────────────
-FOLLOWER_PORT = "/dev/ttyACM0"
-FOLLOWER_ID = "follower2"
+FOLLOWER_PORT = "/dev/ttyACM1"
+FOLLOWER_ID = "follower3"
 CALIBRATION_DIR = Path(".")
 FPS = 30
 
 # ── Recordings to play back-to-back ─────────────────────────────────────────
 RECORDINGS = [
-    Path("e4.json"),
-    Path("kh5.json"),
 
-    Path("Qxg5T.json"),
-    Path("Qxg5M.json"),
 
-    Path("Bb5.json"),
+    Path("e5bl.json"),
+    Path("Kg5bl.json"),
+    Path("Nf6bl.json"),
+    Path("Nc6bl.json"),
 
-    Path("Qxg7T.json"),
-    Path("Qxg7M.json"),
+    Path("Bxg7Tbl.json"),
+    Path("Bxg7Mbl.json"),
 
-    Path("d4.json"),
+    Path("Nxe4Tbl.json"),
+    Path("Nxe4Mbl.json"),
 
-    Path("Bxc6T.json"),
-    Path("Bxc6M.json"),
+    Path("Ng3bl.json"),
 
-    Path("Bg5.json"),
-    Path("Nf3.json"),
-    Path("Be7.json"),
+    Path("Nxh1Tbl.json"),
+    Path("Nxh1Mbl.json"),
 
-    Path("Nxe5T.json"),
-    Path("Nxe5T.json"),
+    Path("dxc6Tbl.json"),
+    Path("dxc6Mbl.json"),
 
-    Path("Ke2.json"),
 
-    Path("Kxf3T.json"),
-    Path("Kxf3M.json"),
 
-    Path("dxe5T.json"),
-    Path("dxe5M.json"),
 
-    Path("Kxg3T.json"),
-    Path("Kxg3M.json"),
 
-    Path("f4.json"),
-    Path("Kh4.json"),
+    # Path("e4.json"),
+    # Path("kh5.json"),
 
-    Path("f4.json"),
-    Path("Kh5.json"),
-    Path("h3.json"),
+    # Path("Qxg5T.json"),
+    # Path("Qxg5M.json"),
+
+    # Path("Bb5.json"),
+
+    # Path("Qxg7T.json"),
+    # Path("Qxg7M.json"),
+
+    # Path("d4.json"),
+
+    # Path("Bxc6T.json"),
+    # Path("Bxc6M.json"),
+
+    # Path("Bg5.json"),
+    # Path("Nf3.json"),
+    # Path("Be7.json"),
+
+    # Path("Nxe5T.json"),
+    # Path("Nxe5T.json"),
+
+    # Path("Ke2.json"),
+
+    # Path("Kxf3T.json"),
+    # Path("Kxf3M.json"),
+
+    # Path("dxe5T.json"),
+    # Path("dxe5M.json"),
+
+    # Path("Kxg3T.json"),
+    # Path("Kxg3M.json"),
+
+    # Path("f4.json"),
+    # Path("Kh4.json"),
+
+    # Path("f4.json"),
+    # Path("Kh5.json"),
+    # Path("h3.json"),
     Path("h4.json"),   
 ]
 SPEED = 2.0  # playback speed multiplier (2.0 = twice as fast)
@@ -129,8 +154,6 @@ def main():
         for idx, rec in enumerate(recordings, 1):
             print(f"[{idx}/{len(recordings)}] {rec}")
             replay_file(follower, rec)
-            input("  ⏎  Press Enter to continue...")
-            print()
 
             # return to home position between moves
             if HOME_FILE.exists():

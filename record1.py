@@ -10,11 +10,10 @@ from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
 
 # ── Configuration ────────────────────────────────────────────────────────────
-FOLLOWER_PORT = "/dev/ttyACM0"
-FOLLOWER_ID = "follower2"
-LEADER_PORT = "/dev/ttyACM1"
+FOLLOWER_PORT = "/dev/ttyACM1"
+FOLLOWER_ID = "follower3"
+LEADER_PORT = "/dev/ttyACM0"
 LEADER_ID = "leader1"
-CALIBRATION_DIR = Path(".")
 RECORDING_FILE = Path("recording.json")
 FPS = 30  # how many positions per second to record / replay
 
@@ -24,7 +23,6 @@ def make_follower():
     cfg = SOFollowerRobotConfig(
         port=FOLLOWER_PORT,
         id=FOLLOWER_ID,
-        calibration_dir=CALIBRATION_DIR,
     )
     return SOFollower(cfg)
 
@@ -33,7 +31,6 @@ def make_leader():
     cfg = SOLeaderTeleopConfig(
         port=LEADER_PORT,
         id=LEADER_ID,
-        calibration_dir=CALIBRATION_DIR,
     )
     return SOLeader(cfg)
 
