@@ -12,9 +12,47 @@ FPS = 30
 
 # ── Recordings to play back-to-back ─────────────────────────────────────────
 RECORDINGS = [
+    Path("e4.json"),
+    Path("kh5.json"),
+
+    Path("Qxg5T.json"),
+    Path("Qxg5M.json"),
+
+    Path("Bb5.json"),
+
+    Path("Qxg7T.json"),
+    Path("Qxg7M.json"),
+
+    Path("d4.json"),
+
+    Path("Bxc6T.json"),
+    Path("Bxc6M.json"),
+
+    Path("Bg5.json"),
+    Path("Nf3.json"),
     Path("Be7.json"),
+
     Path("Nxe5T.json"),
-   
+    Path("Nxe5T.json"),
+
+    Path("Ke2.json"),
+
+    Path("Kxf3T.json"),
+    Path("Kxf3M.json"),
+
+    Path("dxe5T.json"),
+    Path("dxe5M.json"),
+
+    Path("Kxg3T.json"),
+    Path("Kxg3M.json"),
+
+    Path("f4.json"),
+    Path("Kh4.json"),
+
+    Path("f4.json"),
+    Path("Kh5.json"),
+    Path("h3.json"),
+    Path("h4.json"),   
 ]
 SPEED = 2.0  # playback speed multiplier (2.0 = twice as fast)
 HOME_FILE = Path("home.json")  # arm returns here at the end
@@ -91,19 +129,19 @@ def main():
         for idx, rec in enumerate(recordings, 1):
             print(f"[{idx}/{len(recordings)}] {rec}")
             replay_file(follower, rec)
+            input("  ⏎  Press Enter to continue...")
             print()
+
+            # return to home position between moves
+            if HOME_FILE.exists():
+                print(f"  🏠  Playing home.json...")
+                replay_file(follower, HOME_FILE)
+                input("  ⏎  Press Enter to continue...")
+                print()
+            else:
+                print(f"  ⚠️   {HOME_FILE} not found, skipping home position")
     except KeyboardInterrupt:
         print("\n⏹  Stopped early")
-
-    # slowly return to the home position (last frame of home.json)
-    if HOME_FILE.exists():
-        home_frames = json.loads(HOME_FILE.read_text())
-        if home_frames:
-            home_pos = {k: v for k, v in home_frames[-1].items() if not k.startswith("_")}
-            print("🏠  Returning to home position...")
-            go_to_position(follower, home_pos, steps=90, duration=2.5)
-    else:
-        print(f"⚠️   {HOME_FILE} not found, skipping home position")
 
     try:
         follower.disconnect()
