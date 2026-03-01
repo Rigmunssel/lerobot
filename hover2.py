@@ -202,21 +202,38 @@ class Hand:
         self.cfg   = config
         self.robot = None
         self._cmd  = {}
+        self._connected = False
+
+    @property
+    def is_connected(self):
+        """Return True if this hand is available and connected."""
+        return self._connected and self.robot is not None
 
     # ── connection ────────────────────────────────────────────────────────
 
     def connect(self):
-        rc = SOFollowerRobotConfig(
-            port=self.cfg.port, id=self.cfg.robot_id,
-            calibration_dir=Path("."), use_degrees=True,
-        )
-        self.robot = SOFollower(rc)
-        self.robot.connect()
-        self._init_cmd()
+        """Try to connect to the robot. Returns True on success, False on failure."""
+        try:
+            rc = SOFollowerRobotConfig(
+                port=self.cfg.port, id=self.cfg.robot_id,
+                calibration_dir=Path("."), use_degrees=True,
+            )
+            self.robot = SOFollower(rc)
+            self.robot.connect()
+            self._init_cmd()
+            self._connected = True
+            print(f"  ✓ {self.cfg.name} connected on {self.cfg.port}")
+            return True
+        except Exception as e:
+            print(f"  ✗ {self.cfg.name} FAILED to connect on {self.cfg.port}: {e}")
+            self.robot = None
+            self._connected = False
+            return False
 
     def disconnect(self):
-        if self.robot:
+        if self.robot and self._connected:
             self.robot.disconnect()
+            self._connected = False
 
     # ── commanded-state tracking ──────────────────────────────────────────
 
@@ -355,7 +372,7 @@ HAND1_BOARD_POSITIONS = {
 
 HAND1_CONFIG = HandConfig(
     name="hand1",
-    port="/dev/ttyACM4",
+    port="/dev/ttyACM5",
     robot_id="follower1",
     # Hardware geometry
     z_offset=-0.0078,
@@ -456,7 +473,7 @@ HAND2_BOARD_POSITIONS = {
 
 HAND2_CONFIG = HandConfig(
     name="hand2",
-    port="/dev/ttyACM5",
+    port="/dev/ttyACM4",
     robot_id="follower2",
     # Same default values as hand1 — update after calibrating hand2
     z_offset=-0.0078,
@@ -503,41 +520,65 @@ TRANSFER_SQUARES = sorted(HAND1_SQUARES & HAND2_SQUARES)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BOARD STATE TRACKING
+# BOARD STATE TRACKING — Full chess game state with piece types
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Piece symbols for display
+PIECE_SYMBOLS = {
+    'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',  # White
+    'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟',  # Black
+}
+
 def initial_board_state():
-    """Return a set of occupied squares for the standard chess starting position."""
-    occ = set()
-    for col in "abcdefgh":
-        for row in "12":
-            occ.add(f"{col}{row}")
-        for row in "78":
-            occ.add(f"{col}{row}")
-    return occ
+    """
+    Return a dict mapping square names to piece codes for standard chess start.
+    White pieces: uppercase (K, Q, R, B, N, P)
+    Black pieces: lowercase (k, q, r, b, n, p)
+    Empty squares are not in the dict.
+    """
+    board = {}
+    # White pieces (rows 1-2)
+    board['a1'] = 'R'; board['b1'] = 'N'; board['c1'] = 'B'; board['d1'] = 'Q'
+    board['e1'] = 'K'; board['f1'] = 'B'; board['g1'] = 'N'; board['h1'] = 'R'
+    for col in 'abcdefgh':
+        board[f'{col}2'] = 'P'  # White pawns
+    # Black pieces (rows 7-8)
+    board['a8'] = 'r'; board['b8'] = 'n'; board['c8'] = 'b'; board['d8'] = 'q'
+    board['e8'] = 'k'; board['f8'] = 'b'; board['g8'] = 'n'; board['h8'] = 'r'
+    for col in 'abcdefgh':
+        board[f'{col}7'] = 'p'  # Black pawns
+    return board
 
 
-def find_free_transfer_square(occupied, src_hand, dst_hand):
+def find_free_transfer_square(board, src_hand, dst_hand):
     """Return the first transfer square that is empty AND calibrated in both hands."""
     for sq in TRANSFER_SQUARES:
-        if sq not in occupied:
+        if sq not in board:  # Empty square
             if sq in src_hand.cfg.board_positions and sq in dst_hand.cfg.board_positions:
                 return sq
     return None
 
 
-def print_board(occupied):
-    """Print a simple text representation of the board state."""
+def print_board(board):
+    """Print a text representation of the board with piece symbols."""
     print("\n     a  b  c  d  e  f  g  h")
     print("   +------------------------+")
     for row in "87654321":
         pieces = []
         for col in "abcdefgh":
             sq = f"{col}{row}"
-            pieces.append(" ■ " if sq in occupied else " · ")
+            if sq in board:
+                piece = board[sq]
+                sym = PIECE_SYMBOLS.get(piece, piece)
+                pieces.append(f" {sym} ")
+            else:
+                pieces.append(" · ")
         print(f" {row} |{''.join(pieces)}|")
     print("   +------------------------+")
-    print(f"   Occupied: {len(occupied)} squares\n")
+    occupied_count = len(board)
+    white_count = sum(1 for p in board.values() if p.isupper())
+    black_count = sum(1 for p in board.values() if p.islower())
+    print(f"   Pieces: {occupied_count} total ({white_count} white, {black_count} black)\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -584,6 +625,9 @@ def step_to_pose(hand, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
     Move joints in `targets` {name: deg} step-by-step with timed pauses.
     Lead joint (largest Δ) takes step_deg; others scale proportionally.
     Only the joints listed in targets are moved; all others hold via _cmd.
+    
+    IMPORTANT: When within step_deg of target, sends EXACT target values
+    to ensure perfect positioning (no accumulated tolerance drift).
     """
     hand._init_cmd()
     obs       = hand.get_obs()
@@ -592,9 +636,23 @@ def step_to_pose(hand, targets, label="Move", tol=APPROACH_TOLERANCE_DEG,
     while True:
         remaining = {n: targets[n] - commanded[n] for n in targets}
         max_rem   = max(abs(v) for v in remaining.values())
-        if max_rem <= tol:
-            print("  All joints at target.")
+        
+        # If within one step of target, go directly to exact target
+        if max_rem <= step_deg:
+            obs    = hand.get_obs()
+            actual = {n: float(obs[f"{n}.pos"]) for n in targets}
+            steps  = {n: targets[n] - commanded[n] for n in targets}
+            _print_step_table([
+                dict(name=n, actual=actual[n], commanded=commanded[n],
+                     target=targets[n], step=steps[n])
+                for n in targets
+            ], extra="  → FINAL STEP: commanding exact target values")
+            time.sleep(wait_sec)
+            # Send exact target values (not commanded + step)
+            hand.send_joints(**targets)
+            print("  All joints at exact target.")
             return True
+        
         scale = min(1.0, step_deg / max_rem)
         steps = {}
         for n in targets:
@@ -630,14 +688,33 @@ def go_vertical(hand, pan_deg, sh_deg, target_el, label="Vertical"):
     print(f"\n--- [{hand.cfg.name}] {label} ---")
     while True:
         remaining_el = target_el - commanded_el
-        if abs(remaining_el) < TOLERANCE_DEG:
+        
+        # If within one step of target, go directly to exact target
+        if abs(remaining_el) <= STEP_DEG_DOWN:
+            step_el = remaining_el  # Exact remaining distance
+            new_el  = target_el     # Exact target
+            new_wf  = target_wf     # Exact target
+            obs     = hand.get_obs()
+            act_el  = float(obs["elbow_flex.pos"])
+            act_wf  = float(obs["wrist_flex.pos"])
+            curr_z  = hand.get_xyz(pan_deg, sh_deg, act_el)[2]
+            after_z = hand.get_xyz(pan_deg, sh_deg, new_el)[2]
+            _print_step_table([
+                dict(name="elbow_flex", actual=act_el, commanded=commanded_el,
+                     target=target_el, step=step_el),
+                dict(name="wrist_flex", actual=act_wf, commanded=commanded_wf,
+                     target=target_wf, step=-step_el),
+            ], extra=(f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m  → FINAL STEP: exact target"))
+            time.sleep(STEP_WAIT_DOWN_SEC)
+            hand.send_joints(elbow_flex=target_el, wrist_flex=target_wf)
+            history.append((target_el, target_wf))
             obs = hand.get_obs()
             cz  = hand.get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
             print(f"  Done.  Z = {cz:.3f} m")
             return history
+        
         abs_step = min(STEP_DEG_DOWN, abs(remaining_el))
         abs_step = max(MIN_STEP_DEG, abs_step)
-        abs_step = min(abs_step, abs(remaining_el))
         step_el  = math.copysign(abs_step, remaining_el)
         new_el   = commanded_el + step_el
         new_wf   = commanded_wf - step_el
@@ -671,14 +748,30 @@ def go_vertical_reverse(hand, pan_deg, sh_deg, history, label="Vertical (reverse
     print(f"\n--- [{hand.cfg.name}] {label} ---")
     while True:
         remaining_el = start_el - commanded_el
-        if abs(remaining_el) < TOLERANCE_DEG:
+        
+        # If within one step of target, go directly to exact target
+        if abs(remaining_el) <= STEP_DEG_UP:
+            step_el = remaining_el  # Exact remaining distance
+            obs     = hand.get_obs()
+            act_el  = float(obs["elbow_flex.pos"])
+            act_wf  = float(obs["wrist_flex.pos"])
+            curr_z  = hand.get_xyz(pan_deg, sh_deg, act_el)[2]
+            after_z = hand.get_xyz(pan_deg, sh_deg, start_el)[2]
+            _print_step_table([
+                dict(name="elbow_flex", actual=act_el, commanded=commanded_el,
+                     target=start_el, step=step_el),
+                dict(name="wrist_flex", actual=act_wf, commanded=commanded_wf,
+                     target=start_wf, step=-step_el),
+            ], extra=f"Z: {curr_z:+.3f} m  →  {after_z:+.3f} m  → FINAL STEP: exact target")
+            time.sleep(STEP_WAIT_UP_SEC)
+            hand.send_joints(elbow_flex=start_el, wrist_flex=start_wf)
             obs = hand.get_obs()
             cz  = hand.get_xyz(pan_deg, sh_deg, float(obs["elbow_flex.pos"]))[2]
             print(f"  Done.  Z = {cz:.3f} m")
             return
+        
         abs_step = min(STEP_DEG_UP, abs(remaining_el))
         abs_step = max(MIN_STEP_DEG, abs_step)
-        abs_step = min(abs_step, abs(remaining_el))
         step_el  = math.copysign(abs_step, remaining_el)
         new_el   = commanded_el + step_el
         new_wf   = start_wf - (new_el - start_el)
@@ -718,18 +811,27 @@ def move_to_angles(hand, pan_deg, sh_deg, el_deg, wf_deg, prefix=""):
     while True:
         obs      = hand.get_obs()
         curr_pan = float(obs["shoulder_pan.pos"])
-        diff_pan = pan_deg - curr_pan
-        if abs(diff_pan) <= TOLERANCE_PAN:
-            print("  Pan aligned.")
+        cmd_pan  = hand._cmd.get("shoulder_pan", curr_pan)
+        diff_pan = pan_deg - cmd_pan
+        
+        # If within one step of target, go directly to exact target
+        if abs(diff_pan) <= PAN_STEP_DEG:
+            _print_step_table([
+                dict(name="shoulder_pan", actual=curr_pan,
+                     commanded=cmd_pan, target=pan_deg, step=diff_pan),
+            ], extra="  → FINAL STEP: commanding exact target")
+            time.sleep(STEP_WAIT_SEC)
+            hand.send_joints(shoulder_pan=pan_deg)  # Exact target
+            print("  Pan aligned (exact).")
             break
+        
         step_pan = math.copysign(min(PAN_STEP_DEG, abs(diff_pan)), diff_pan)
         _print_step_table([
             dict(name="shoulder_pan", actual=curr_pan,
-                 commanded=hand._cmd.get("shoulder_pan", curr_pan),
-                 target=pan_deg, step=step_pan),
+                 commanded=cmd_pan, target=pan_deg, step=step_pan),
         ])
         time.sleep(STEP_WAIT_SEC)
-        hand.send_joints(shoulder_pan=curr_pan + step_pan)
+        hand.send_joints(shoulder_pan=cmd_pan + step_pan)
 
     # ── Phase 2: sweep shoulder (elbow maintains sum constraint) ──────────
     obs          = hand.get_obs()
@@ -740,12 +842,30 @@ def move_to_angles(hand, pan_deg, sh_deg, el_deg, wf_deg, prefix=""):
           f"{commanded_sh:.1f}° → {sh_deg:.1f}° ---")
     while True:
         remaining = sh_deg - commanded_sh
-        if abs(remaining) <= TOLERANCE_DEG:
-            print("  Shoulder at target.")
+        
+        # If within one step of target, go directly to exact target
+        if abs(remaining) <= STEP_DEG:
+            new_sh  = sh_deg  # Exact target
+            new_el  = el_at_target  # Exact target
+            step_sh = remaining
+            step_el = new_el - commanded_el
+            obs     = hand.get_obs()
+            act_sh  = float(obs["shoulder_lift.pos"])
+            act_el  = float(obs["elbow_flex.pos"])
+            _print_step_table([
+                dict(name="shoulder_lift", actual=act_sh, commanded=commanded_sh,
+                     target=sh_deg, step=step_sh),
+                dict(name="elbow_flex",    actual=act_el, commanded=commanded_el,
+                     target=el_at_target,  step=step_el),
+            ], extra=(f"sum after step: {new_sh:.2f}° + {new_el:.2f}° = "
+                      f"{new_sh + new_el:.2f}°  → FINAL STEP: exact target"))
+            time.sleep(STEP_WAIT_SEC)
+            hand.send_joints(shoulder_lift=sh_deg, elbow_flex=el_at_target)
+            print("  Shoulder at target (exact).")
             break
+        
         abs_step = min(STEP_DEG, abs(remaining))
         abs_step = max(MIN_STEP_DEG, abs_step)
-        abs_step = min(abs_step, abs(remaining))
         step_sh  = math.copysign(abs_step, remaining)
         new_sh   = commanded_sh + step_sh
         new_el   = FOREARM_ANGLE_DEG - new_sh
@@ -931,7 +1051,12 @@ def pick_and_place(hand, src_sq, dst_sq, adjust_pick=False, adjust_drop=False):
     # ── 12. Go back up ───────────────────────────────────────────────────
     go_vertical_reverse(hand, pan2, sh2, down_history2, label="Go up (drop)")
 
-    # ── 13. Return to base pose ──────────────────────────────────────────
+    return True
+
+
+def return_to_base(hand):
+    """Return the arm to its home pose. Call once after a complete move sequence."""
+    cfg = hand.cfg
     step_to_pose(hand, {
         "shoulder_pan":  cfg.grasp_pan_deg,
         "shoulder_lift": cfg.grasp_lift_deg,
@@ -940,8 +1065,6 @@ def pick_and_place(hand, src_sq, dst_sq, adjust_pick=False, adjust_drop=False):
         "wrist_roll":    cfg.grasp_wrist_roll_deg,
         "gripper":       cfg.gripper_default_deg,
     }, label="Return to base")
-
-    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -957,26 +1080,43 @@ def main():
     hand1.load_coordinates()
     hand2.load_coordinates()
 
-    # Connect both arms
+    # Try to connect both arms (non-fatal if one fails)
+    print("\nConnecting arms...")
     hand1.connect()
     hand2.connect()
 
-    # Board state — standard chess starting position
-    occupied = initial_board_state()
+    # Check what's available
+    if not hand1.is_connected and not hand2.is_connected:
+        print("\n  ERROR: No arms available! Check connections and ports.")
+        return
+
+    if hand1.is_connected and hand2.is_connected:
+        print("\n  Both arms connected — full board coverage available.")
+    elif hand1.is_connected:
+        print(f"\n  WARNING: Only {hand1.cfg.name} available — limited to columns a,b,c,d + e3-e6")
+    else:
+        print(f"\n  WARNING: Only {hand2.cfg.name} available — limited to columns e,f,g,h + d3-d6")
+
+    # Board state — standard chess starting position (dict: square -> piece)
+    board = initial_board_state()
 
     try:
         while True:
             # ── Prompt ────────────────────────────────────────────────────
             print("\n" + "=" * 60)
+            # Show availability status
+            h1_status = "✓" if hand1.is_connected else "✗"
+            h2_status = "✓" if hand2.is_connected else "✗"
+            print(f"  [hand1:{h1_status}] [hand2:{h2_status}]")
             raw = input("Enter move (e.g. 'd2 d4'), 'b'=board, 'r'=reset, 'q'=quit: ").strip().lower()
 
             if raw == 'q':
                 break
             if raw == 'b':
-                print_board(occupied)
+                print_board(board)
                 continue
             if raw == 'r':
-                occupied = initial_board_state()
+                board = initial_board_state()
                 print("  Board reset to starting position.")
                 continue
 
@@ -994,7 +1134,9 @@ def main():
                 print(f"  Unknown square(s): {missing}")
                 continue
 
-            is_capture = dst in occupied
+            # Check if there's a piece at destination (capture)
+            is_capture = dst in board
+            captured_piece = board.get(dst, None)
 
             # ── Determine hand assignment ─────────────────────────────────
             h1_src = src in HAND1_SQUARES
@@ -1003,13 +1145,28 @@ def main():
             h2_dst = dst in HAND2_SQUARES
 
             # Prefer a single hand that can reach both src and dst
-            if h1_src and h1_dst:
+            # But only if that hand is connected!
+            move_type = None
+            move_hand = None
+            src_hand = None
+            dst_hand = None
+
+            if h1_src and h1_dst and hand1.is_connected:
                 move_type = "direct"
                 move_hand = hand1
-            elif h2_src and h2_dst:
+            elif h2_src and h2_dst and hand2.is_connected:
                 move_type = "direct"
                 move_hand = hand2
+            elif h1_src and h1_dst and not hand1.is_connected:
+                # Hand1 could do it but isn't connected
+                print(f"  Move {src}→{dst} requires hand1, but it's not connected!")
+                continue
+            elif h2_src and h2_dst and not hand2.is_connected:
+                # Hand2 could do it but isn't connected
+                print(f"  Move {src}→{dst} requires hand2, but it's not connected!")
+                continue
             else:
+                # Cross-hand transfer needed
                 move_type = "cross"
                 # The hand that can reach src picks; the other delivers to dst
                 if h1_src:
@@ -1017,13 +1174,26 @@ def main():
                 else:
                     src_hand, dst_hand = hand2, hand1
 
+                # Check if both hands needed for cross-transfer are connected
+                if not src_hand.is_connected:
+                    print(f"  Move {src}→{dst} requires {src_hand.cfg.name} to pick, but it's not connected!")
+                    continue
+                if not dst_hand.is_connected:
+                    print(f"  Move {src}→{dst} requires {dst_hand.cfg.name} to place, but it's not connected!")
+                    continue
+
             # ── Handle capture (remove piece at dst first) ────────────────
+            cap_hand = None
             if is_capture:
                 # Use the hand that will also do the final drop at dst
                 if move_type == "direct":
                     cap_hand = move_hand
                 else:
                     cap_hand = dst_hand
+
+                if not cap_hand.is_connected:
+                    print(f"  Capture at {dst} requires {cap_hand.cfg.name}, but it's not connected!")
+                    continue
 
                 out_sq = cap_hand.cfg.out_position
                 if out_sq not in cap_hand.cfg.board_positions:
@@ -1033,10 +1203,10 @@ def main():
                     print(f"  {cap_hand.cfg.name} has no position for '{dst}'!")
                     continue
 
-                print(f"\n>>> CAPTURE: {cap_hand.cfg.name} removes piece from {dst}")
+                print(f"\n>>> CAPTURE: {cap_hand.cfg.name} removes {PIECE_SYMBOLS.get(captured_piece, captured_piece)} from {dst}")
                 if not pick_and_place(cap_hand, dst, out_sq):
                     continue
-                occupied.discard(dst)
+                del board[dst]  # Remove captured piece from board
 
             # ── Execute the move ──────────────────────────────────────────
             if move_type == "direct":
@@ -1055,7 +1225,7 @@ def main():
 
             else:
                 # ── Cross-hand transfer via a common square ───────────────
-                transfer_sq = find_free_transfer_square(occupied, src_hand, dst_hand)
+                transfer_sq = find_free_transfer_square(board, src_hand, dst_hand)
                 if transfer_sq is None:
                     print("  No free transfer square available!")
                     continue
@@ -1079,15 +1249,38 @@ def main():
                                           adjust_drop=True):
                         continue
 
+            # ── Return all used hands to base ─────────────────────────────
+            if move_type == "direct":
+                if move_hand and move_hand.is_connected:
+                    return_to_base(move_hand)
+            else:
+                if src_hand and src_hand.is_connected:
+                    return_to_base(src_hand)
+                if dst_hand and dst_hand.is_connected:
+                    return_to_base(dst_hand)
+            if cap_hand and cap_hand.is_connected and cap_hand not in (move_hand, src_hand, dst_hand):
+                return_to_base(cap_hand)
+
             # ── Update board state ────────────────────────────────────────
-            occupied.discard(src)
-            occupied.add(dst)
-            print(f"\n  Board updated: {src} → {dst}")
+            moving_piece = board.get(src, '?')
+            if src in board:
+                del board[src]
+            board[dst] = moving_piece
+            piece_sym = PIECE_SYMBOLS.get(moving_piece, moving_piece)
+            if is_capture:
+                cap_sym = PIECE_SYMBOLS.get(captured_piece, captured_piece)
+                print(f"\n  Board updated: {piece_sym} {src} → {dst} (captured {cap_sym})")
+            else:
+                print(f"\n  Board updated: {piece_sym} {src} → {dst}")
 
     finally:
-        hand1.disconnect()
-        hand2.disconnect()
-        print("Both hands disconnected.")
+        if hand1.is_connected:
+            hand1.disconnect()
+            print(f"  {hand1.cfg.name} disconnected.")
+        if hand2.is_connected:
+            hand2.disconnect()
+            print(f"  {hand2.cfg.name} disconnected.")
+        print("Done.")
 
 
 if __name__ == "__main__":

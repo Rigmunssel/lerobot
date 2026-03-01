@@ -6,7 +6,7 @@ from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 from lerobot.model.kinematics import RobotKinematics
 
 # Setup (Use your actual paths/ports)
-PORT = "/dev/ttyACM5"
+PORT = "/dev/ttyACM4"
 ROBOT_ID = "follower2"
 
 # ALWAYS use absolute paths with placo!

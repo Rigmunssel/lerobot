@@ -6,8 +6,8 @@ from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 from lerobot.model.kinematics import RobotKinematics
 
 # Setup (Use your actual paths/ports)
-PORT = "/dev/ttyACM3"
-ROBOT_ID = "follower1"
+PORT = "/dev/ttyACM5"
+ROBOT_ID = "follower2"
 # ALWAYS use absolute paths with placo!
 URDF_PATH = os.path.abspath("so101_new_calib.urdf")
 
